@@ -73,7 +73,14 @@ export default function Noticed() {
     });
     const { raw, error } = await res.json();
     if (error) throw new Error(error);
-    return JSON.parse(raw);
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      // engine replied but not clean JSON — pull the object out if wrapped in text
+      const m = raw && raw.match(/\{[\s\S]*\}/);
+      if (m) return JSON.parse(m[0]);
+      throw new Error("Could not read engine reply");
+    }
   };
 
   /* ── voice ──────────────────────────────── */
@@ -157,7 +164,7 @@ ONLY JSON:
       await persist({ ...db, people, weeks: [...db.weeks, { at: TODAY(), text }] });
       setTranscript(""); setWorking(""); setKept(names);
     } catch (e) {
-      console.error(e); setWorking("That didn't land. Try again.");
+      console.error(e); setWorking("Hm, that didn't land: " + (e?.message || "unknown") + ". Try again.");
     }
   };
 
