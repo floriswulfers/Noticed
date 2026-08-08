@@ -164,12 +164,21 @@ export default function Noticed() {
     r.interimResults = true;
     r.lang = navigator.language || "en-US";
     let final = transcript;
+    const finalized = new Set(); // result indices already appended to `final` — guards against
+    // mobile browsers (Android Chrome especially) re-delivering already finalized results with
+    // a stale/incorrect e.resultIndex, which would otherwise duplicate them on every event.
     r.onresult = (e) => {
       let interim = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
+      for (let i = 0; i < e.results.length; i++) {
         const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) final += t + " ";
-        else interim += t;
+        if (e.results[i].isFinal) {
+          if (!finalized.has(i)) {
+            finalized.add(i);
+            final += t + " ";
+          }
+        } else {
+          interim += t;
+        }
       }
       setTranscript(final + interim);
     };
