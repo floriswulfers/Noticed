@@ -1,6 +1,6 @@
 "use client";
 import React, { useState, useEffect, useRef } from "react";
-import { getUserKey, loadState, saveState } from "../lib/supabase";
+import { loadState, saveState, getSession, onAuthChange, signIn, signUp, signOut } from "../lib/supabase";
 
 /* ─────────────────────────────────────────────
    NOTICED — v1.0 (real, database-backed)
@@ -18,6 +18,7 @@ const DEEP = "#7A5C6E";
 
 const DAYS = (iso) => (iso ? Math.floor((Date.now() - new Date(iso).getTime()) / 864e5) : 999);
 const TODAY = () => new Date().toISOString().slice(0, 10);
+const BLANK_DB = { people: [], weeks: [], gesture: null, restedOn: null, user: null, onboarded: false };
 
 const THRESHOLD = [
   { big: "Noticed", small: "A quieter way to love the people who matter." },
@@ -29,9 +30,18 @@ const THRESHOLD = [
 ];
 
 export default function Noticed() {
-  const [db, setDb] = useState({ people: [], weeks: [], gesture: null, restedOn: null, user: null, onboarded: false });
+  const [db, setDb] = useState(BLANK_DB);
   const [loaded, setLoaded] = useState(false);
-  const [userKey, setUserKey] = useState(null);
+  const [loadError, setLoadError] = useState("");
+  const [saveError, setSaveError] = useState("");
+  const [retryTick, setRetryTick] = useState(0);
+  const [session, setSession] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authMode, setAuthMode] = useState("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
   const [slide, setSlide] = useState(0);
   const [nameInput, setNameInput] = useState("");
   const [firstPerson, setFirstPerson] = useState("");
@@ -46,22 +56,84 @@ export default function Noticed() {
   const rec = useRef(null);
   const asked = useRef(false);
 
-  /* ── load from the real database ──────────── */
+  /* ── who's signed in ────────────────────────── */
   useEffect(() => {
+    let subscription;
     (async () => {
-      const k = getUserKey();
-      setUserKey(k);
-      const saved = await loadState(k);
-      if (saved) setDb(saved);
-      setLoaded(true);
+      const s = await getSession();
+      setSession(s);
+      setAuthChecked(true);
+      subscription = onAuthChange((s2) => setSession(s2));
     })();
     const SR = typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition);
     if (!SR) setSupported(false);
+    return () => subscription?.unsubscribe();
   }, []);
+
+  /* ── load that person's data from the real database ── */
+  useEffect(() => {
+    let current = true;
+    asked.current = false;
+    if (!session) {
+      setDb(BLANK_DB);
+      setLoaded(false);
+      setLoadError("");
+      return () => { current = false; };
+    }
+    (async () => {
+      setLoaded(false);
+      setLoadError("");
+      try {
+        const saved = await loadState(session.user.id);
+        if (!current) return; // a newer sign in has since superseded this fetch
+        setDb(saved || BLANK_DB);
+        setLoaded(true);
+      } catch (e) {
+        if (!current) return;
+        // Don't fall back to a blank db here — that would look identical to
+        // "brand new user" and silently walk an existing user back through
+        // onboarding, which then overwrites their real saved data.
+        setLoadError(e?.message || "Couldn't load your data.");
+      }
+    })();
+    return () => { current = false; };
+  }, [session?.user?.id, retryTick]);
 
   const persist = async (next) => {
     setDb(next);
-    if (userKey) await saveState(userKey, next);
+    if (!session?.user?.id) return;
+    try {
+      await saveState(session.user.id, next);
+      setSaveError("");
+    } catch (e) {
+      setSaveError(e?.message || "Couldn't save just now.");
+    }
+  };
+
+  /* ── sign in, sign up, sign out ─────────────── */
+  const handleAuth = async () => {
+    setAuthBusy(true);
+    setAuthMessage("");
+    try {
+      if (authMode === "signin") {
+        await signIn(email.trim(), password);
+      } else {
+        const { session: newSession } = await signUp(email.trim(), password);
+        if (!newSession) {
+          setAuthMessage("Check your email to confirm your account, then sign in.");
+          setAuthMode("signin");
+        }
+      }
+      setPassword("");
+    } catch (e) {
+      setAuthMessage(e?.message || "Something went wrong");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await signOut();
   };
 
   /* ── the engine, via secret server route ──── */
@@ -282,6 +354,52 @@ ONLY JSON:
     dot: { width: 7, height: 7, borderRadius: "50%", display: "inline-block", margin: "0 5px" },
   };
 
+  if (!authChecked)
+    return <div style={{ ...S.shell, display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ color: FAINT, fontSize: 13 }}>Opening…</span></div>;
+
+  /* ── SIGN IN / SIGN UP ──────────────────── */
+  if (!session) {
+    return (
+      <div style={{ ...S.shell, display: "flex", flexDirection: "column", justifyContent: "center", padding: "0 34px" }}>
+        <style>{`@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500&display=swap');input::placeholder{color:#B0A692}`}</style>
+        <div style={S.mark}>Noticed</div>
+        <div style={{ ...S.serif, margin: "18px 0 24px", color: INK_SOFT }}>
+          {authMode === "signin" ? "Welcome back." : "Let's begin."}
+        </div>
+        <input style={S.inp} type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
+        <input
+          style={S.inp}
+          type="password"
+          placeholder="Password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && handleAuth()}
+        />
+        {authMessage && <div style={{ ...S.body, color: EMBER, marginBottom: 8 }}>{authMessage}</div>}
+        <button style={S.primary} disabled={authBusy || !email.trim() || !password.trim()} onClick={handleAuth}>
+          {authBusy ? "…" : authMode === "signin" ? "Sign in" : "Create account"}
+        </button>
+        <button
+          style={S.ghost}
+          onClick={() => { setAuthMode(authMode === "signin" ? "signup" : "signin"); setAuthMessage(""); }}
+        >
+          {authMode === "signin" ? "New here? Create an account" : "Already have an account? Sign in"}
+        </button>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div style={{ ...S.shell, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "0 34px", textAlign: "center" }}>
+        <div style={S.mark}>Noticed</div>
+        <div style={{ ...S.body, margin: "18px 0 4px" }}>Couldn't load your data.</div>
+        <div style={{ ...S.body, fontSize: 12.5, color: FAINT, marginBottom: 8 }}>{loadError}</div>
+        <button style={S.primary} onClick={() => setRetryTick((t) => t + 1)}>Try again</button>
+      </div>
+    );
+  }
+
   if (!loaded)
     return <div style={{ ...S.shell, display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ color: FAINT, fontSize: 13 }}>Opening…</span></div>;
 
@@ -318,17 +436,18 @@ ONLY JSON:
           <button
             style={{ ...S.primary, marginTop: 22 }}
             disabled={!nameInput.trim() || !firstPerson.trim()}
-            onClick={() => {
+            onClick={async () => {
               const seed = firstPerson.trim()
                 ? [{ id: `p-${Date.now()}`, name: firstPerson.trim(), who: "", label: "", carries: "", loves: "", threads: [], birthday: "", last: new Date().toISOString(), upcoming: [], hardDates: [] }]
                 : [];
-              persist({ ...db, user: nameInput.trim(), onboarded: true, people: seed });
+              await persist({ ...db, user: nameInput.trim(), onboarded: true, people: seed });
               setView("keep");
             }}
           >
             Begin
           </button>
         )}
+        {saveError && <div style={{ ...S.body, color: EMBER, fontSize: 12.5, marginTop: 14 }}>{saveError}</div>}
       </div>
     );
   }
@@ -355,6 +474,7 @@ ONLY JSON:
           <input style={S.inp} type="date" value={editing.birthday || ""} onChange={(e) => setEditing({ ...editing, birthday: e.target.value })} />
           <button style={S.primary} onClick={saveEdit}>Save</button>
           <button style={S.ghost} onClick={() => setEditing(null)}>Cancel</button>
+          {saveError && <div style={{ ...S.body, color: EMBER, fontSize: 12.5, marginTop: 14 }}>{saveError}</div>}
         </div>
       </div>
     );
@@ -373,8 +493,15 @@ ONLY JSON:
           <button style={S.nb(view === "keep")} onClick={() => setView("keep")}>Keep</button>
           <button style={S.nb(view === "today")} onClick={() => setView("today")}>Today</button>
           <button style={S.nb(view === "people")} onClick={() => setView("people")}>People</button>
+          <button style={S.nb(false)} onClick={handleSignOut}>Sign out</button>
         </nav>
       </header>
+
+      {saveError && (
+        <div style={{ margin: "0 20px 16px", padding: "10px 14px", background: "#B4603A14", border: `1px solid ${EMBER}`, borderRadius: 4, color: EMBER, fontSize: 12.5 }}>
+          {saveError}
+        </div>
+      )}
 
       {view === "keep" && !kept && (
         <div style={S.card}>
@@ -440,7 +567,7 @@ ONLY JSON:
             <div style={S.label}>How did it land?</div>
             <input style={{ ...S.ta, minHeight: 0, marginTop: 0, padding: "12px 14px" }} placeholder="However it went, if you'd like to remember it" value={note} onChange={(e) => setNote(e.target.value)} />
             <button style={S.primary} onClick={done}>I did it</button>
-            <button style={S.ghost} onClick={() => persist({ ...db, gesture: null, restedOn: TODAY() })}>Not today</button>
+            <button style={S.ghost} onClick={async () => await persist({ ...db, gesture: null, restedOn: TODAY() })}>Not today</button>
           </div>
           <p style={{ ...S.body, padding: "4px 26px", fontSize: 12.5, color: FAINT }}>One person. Never a list. Never a guilt trip.</p>
         </>
