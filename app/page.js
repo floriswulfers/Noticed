@@ -158,30 +158,34 @@ export default function Noticed() {
   };
 
   /* ── voice ──────────────────────────────── */
-  // Mobile browsers (Android Chrome especially) don't keep a single continuous
-  // recognition session reliable: they can end it on their own mid capture, and
-  // when they redeliver results, the index bookkeeping is unreliable. So instead
-  // of accumulating text incrementally, each event rebuilds this instance's final
-  // text fresh from the complete result set, and a restart folds that text into
-  // `listenBase` exactly once before the next instance starts from an empty slate.
+  // Continuous mode is unreliable on mobile (Android Chrome especially): a
+  // single long-lived session restarts and redelivers results on its own in
+  // ways that duplicate text no matter how the results are reassembled. So
+  // each recognition instance here captures exactly one utterance (continuous
+  // = false): it listens until a pause, returns one final result, and ends.
+  // That single utterance is committed to `listenBase` exactly once in onend,
+  // then — if the user hasn't pressed stop — a fresh instance starts for the
+  // next utterance with an empty result list, so nothing already committed
+  // can be re-added.
   const startRecognitionInstance = () => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     const r = new SR();
-    r.continuous = true;
+    r.continuous = false;
     r.interimResults = true;
     r.lang = navigator.language || "en-US";
 
-    let sessionFinal = "";
+    let utteranceFinal = "";
 
     r.onresult = (e) => {
       let interim = "";
-      sessionFinal = "";
+      let finalText = "";
       for (let i = 0; i < e.results.length; i++) {
         const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) sessionFinal += t + " ";
+        if (e.results[i].isFinal) finalText += t + " ";
         else interim += t;
       }
-      const combined = [listenBase.current, sessionFinal.trim()].filter(Boolean).join(" ");
+      utteranceFinal = finalText.trim();
+      const combined = [listenBase.current, utteranceFinal].filter(Boolean).join(" ");
       setTranscript(interim ? `${combined} ${interim}` : combined);
     };
 
@@ -192,9 +196,9 @@ export default function Noticed() {
     };
 
     r.onend = () => {
-      listenBase.current = [listenBase.current, sessionFinal.trim()].filter(Boolean).join(" ");
+      listenBase.current = [listenBase.current, utteranceFinal].filter(Boolean).join(" ");
       if (wantListening.current) {
-        startRecognitionInstance();
+        startRecognitionInstance(); // pick up the next utterance
       } else {
         setListening(false);
       }
