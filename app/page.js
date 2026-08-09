@@ -55,6 +55,8 @@ export default function Noticed() {
   const [editing, setEditing] = useState(null);
   const rec = useRef(null);
   const asked = useRef(false);
+  const wantListening = useRef(false);
+  const listenBase = useRef(""); // committed text: manual typing + everything finalized across restarts
 
   /* ── who's signed in ────────────────────────── */
   useEffect(() => {
@@ -156,38 +158,62 @@ export default function Noticed() {
   };
 
   /* ── voice ──────────────────────────────── */
-  const listen = () => {
+  // Mobile browsers (Android Chrome especially) don't keep a single continuous
+  // recognition session reliable: they can end it on their own mid capture, and
+  // when they redeliver results, the index bookkeeping is unreliable. So instead
+  // of accumulating text incrementally, each event rebuilds this instance's final
+  // text fresh from the complete result set, and a restart folds that text into
+  // `listenBase` exactly once before the next instance starts from an empty slate.
+  const startRecognitionInstance = () => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return;
     const r = new SR();
     r.continuous = true;
     r.interimResults = true;
     r.lang = navigator.language || "en-US";
-    let final = transcript;
-    const finalized = new Set(); // result indices already appended to `final` — guards against
-    // mobile browsers (Android Chrome especially) re-delivering already finalized results with
-    // a stale/incorrect e.resultIndex, which would otherwise duplicate them on every event.
+
+    let sessionFinal = "";
+
     r.onresult = (e) => {
       let interim = "";
+      sessionFinal = "";
       for (let i = 0; i < e.results.length; i++) {
         const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) {
-          if (!finalized.has(i)) {
-            finalized.add(i);
-            final += t + " ";
-          }
-        } else {
-          interim += t;
-        }
+        if (e.results[i].isFinal) sessionFinal += t + " ";
+        else interim += t;
       }
-      setTranscript(final + interim);
+      const combined = [listenBase.current, sessionFinal.trim()].filter(Boolean).join(" ");
+      setTranscript(interim ? `${combined} ${interim}` : combined);
     };
-    r.onend = () => setListening(false);
+
+    r.onerror = (e) => {
+      if (["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported"].includes(e.error)) {
+        wantListening.current = false;
+      }
+    };
+
+    r.onend = () => {
+      listenBase.current = [listenBase.current, sessionFinal.trim()].filter(Boolean).join(" ");
+      if (wantListening.current) {
+        startRecognitionInstance();
+      } else {
+        setListening(false);
+      }
+    };
+
     r.start();
     rec.current = r;
+  };
+
+  const listen = () => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return;
+    listenBase.current = transcript.trim(); // keep anything typed before pressing Speak
+    wantListening.current = true;
+    startRecognitionInstance();
     setListening(true);
   };
   const stop = () => {
+    wantListening.current = false;
     rec.current?.stop();
     setListening(false);
   };
