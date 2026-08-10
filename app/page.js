@@ -20,6 +20,198 @@ const DAYS = (iso) => (iso ? Math.floor((Date.now() - new Date(iso).getTime()) /
 const TODAY = () => new Date().toISOString().slice(0, 10);
 const BLANK_DB = { people: [], weeks: [], gesture: null, restedOn: null, user: null, onboarded: false };
 
+/* ── name matching ──────────────────────────────────
+   Identity resolution lives here, in inspectable code, not
+   in the LLM's own judgment — the model just extracts names;
+   deciding whether two names are the same person is deterministic
+   and, past an exact match, always requires human confirmation.
+   ─────────────────────────────────────────────────── */
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const row = [i];
+    for (let j = 1; j <= n; j++) {
+      row[j] = a[i - 1] === b[j - 1]
+        ? prev[j - 1]
+        : 1 + Math.min(prev[j - 1], prev[j], row[j - 1]);
+    }
+    prev = row;
+  }
+  return prev[n];
+}
+
+function nameSimilarity(a, b) {
+  const an = (a || "").trim().toLowerCase();
+  const bn = (b || "").trim().toLowerCase();
+  if (!an || !bn) return 0;
+  if (an === bn) return 1;
+  const maxLen = Math.max(an.length, bn.length);
+  return 1 - levenshtein(an, bn) / maxLen;
+}
+
+function namesOf(p) {
+  return [p.name, p.label, ...(p.aliases || [])].filter(Boolean);
+}
+
+// Forgiving parser for the free-typed/spoken "nicknames" field: accepts commas,
+// periods, or plain whitespace (spaces/new lines) as separators, since voice
+// dictation often drops punctuation. Never throws — always returns an array,
+// even given a non-string input.
+function parseAliases(raw) {
+  return String(raw || "")
+    .split(/[,.]+|\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function findExactPersonIndex(people, name) {
+  const n = (name || "").trim().toLowerCase();
+  if (!n) return -1;
+  return people.findIndex((p) => namesOf(p).some((x) => x.toLowerCase() === n));
+}
+
+// A candidate is a close but not exact spelling (typos, transcription variants
+// like "Stacy"/"Stacey"). It is never auto applied — only ever offered for the
+// user to confirm. Short names are excluded; a one letter edit on a very short
+// name isn't a meaningful enough signal to interrupt the user over.
+function findBestCandidate(people, name) {
+  const target = (name || "").trim();
+  if (target.length < 3) return null;
+  let best = null;
+  people.forEach((p) => {
+    namesOf(p).forEach((known) => {
+      if (known.length < 3) return;
+      const sim = nameSimilarity(target, known);
+      if (sim >= 0.6 && sim < 1 && (!best || sim > best.sim)) best = { person: p, sim };
+    });
+  });
+  return best;
+}
+
+function newPerson(f) {
+  return {
+    id: `p-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    name: f.name, who: f.who || "", label: "", carries: f.carries || "", loves: f.loves || "",
+    threads: f.threads || [], birthday: "", aliases: [],
+    last: f.sawThem ? new Date().toISOString() : new Date(Date.now() - 14 * 864e5).toISOString(),
+    upcoming: f.upcoming || [], hardDates: f.hardDates || [],
+  };
+}
+
+// Merges a fresh mention `f` (from the engine's extraction) into an existing
+// person `p`. `learnAlias`, when given, is the exact spelling that was just
+// confirmed to refer to `p` — it's remembered so the same spelling auto
+// matches next time without asking again.
+function mergeIntoPerson(p, f, learnAlias) {
+  const aliases = [...(p.aliases || [])];
+  if (learnAlias) {
+    const t = learnAlias.trim();
+    if (t && !namesOf(p).some((x) => x.toLowerCase() === t.toLowerCase())) aliases.push(t);
+  }
+  return {
+    ...p,
+    who: p.who || f.who,
+    carries: f.carries || p.carries,
+    loves: [p.loves, f.loves].filter(Boolean).join(", "),
+    threads: [...(p.threads || []), ...(f.threads || [])].slice(-30),
+    last: f.sawThem ? new Date().toISOString() : p.last,
+    upcoming: [...(p.upcoming || []), ...(f.upcoming || [])],
+    hardDates: [...(p.hardDates || []), ...(f.hardDates || [])],
+    aliases,
+  };
+}
+
+/* ── merging two people ─────────────────────────────
+   Combines everything into `primary`; nothing from `other` is
+   dropped — text fields are combined rather than picked between,
+   and lists are concatenated and deduplicated, never truncated.
+   ─────────────────────────────────────────────────── */
+function combineText(a, b) {
+  const at = (a || "").trim();
+  const bt = (b || "").trim();
+  if (!at) return bt;
+  if (!bt || at.toLowerCase() === bt.toLowerCase()) return at;
+  return `${at} ${bt}`;
+}
+
+function laterOf(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return new Date(a).getTime() >= new Date(b).getTime() ? a : b;
+}
+
+function dedupeStrings(arr) {
+  const seen = new Set();
+  const out = [];
+  (arr || []).forEach((s) => {
+    const t = (s || "").trim();
+    if (!t || seen.has(t.toLowerCase())) return;
+    seen.add(t.toLowerCase());
+    out.push(t);
+  });
+  return out;
+}
+
+function dedupeEvents(arr, dateKey) {
+  const seen = new Set();
+  const out = [];
+  (arr || []).forEach((ev) => {
+    if (!ev) return;
+    const key = `${(ev.what || "").trim().toLowerCase()}|${ev[dateKey] || ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(ev);
+  });
+  return out;
+}
+
+function mergePeople(primary, other) {
+  const aliasSeen = new Set();
+  const aliases = [];
+  const addAlias = (a) => {
+    const t = (a || "").trim();
+    if (!t) return;
+    const key = t.toLowerCase();
+    if (key === primary.name.trim().toLowerCase() || aliasSeen.has(key)) return;
+    aliasSeen.add(key);
+    aliases.push(t);
+  };
+  (primary.aliases || []).forEach(addAlias);
+  addAlias(primary.label);
+  addAlias(other.name);
+  addAlias(other.label);
+  (other.aliases || []).forEach(addAlias);
+
+  return {
+    ...primary,
+    label: primary.label || other.label || "",
+    who: combineText(primary.who, other.who),
+    carries: combineText(primary.carries, other.carries),
+    loves: [primary.loves, other.loves].filter(Boolean).join(", "),
+    threads: dedupeStrings([...(primary.threads || []), ...(other.threads || [])]),
+    birthday: primary.birthday || other.birthday || "",
+    last: laterOf(primary.last, other.last),
+    upcoming: dedupeEvents([...(primary.upcoming || []), ...(other.upcoming || [])], "when"),
+    hardDates: dedupeEvents([...(primary.hardDates || []), ...(other.hardDates || [])], "date"),
+    aliases,
+  };
+}
+
+// Raw fetch failures ("TypeError: Load failed" on Safari, "Failed to fetch"
+// on Chrome) mean the request never reached the server at all — a
+// connection problem, not something the app did wrong. Surface that plainly
+// instead of the cryptic raw error text.
+function friendlyError(e) {
+  const msg = e?.message || "";
+  if (!msg || /load failed|failed to fetch|network/i.test(msg)) {
+    return "A network problem — check your connection and try again.";
+  }
+  return msg;
+}
+
 const THRESHOLD = [
   { big: "Noticed", small: "A quieter way to love the people who matter." },
   { big: "We think of them often.", small: "We just forget to let them know. Life gets loud." },
@@ -53,10 +245,25 @@ export default function Noticed() {
   const [note, setNote] = useState("");
   const [supported, setSupported] = useState(true);
   const [editing, setEditing] = useState(null);
+  const [aliasInput, setAliasInput] = useState(""); // raw text of the nicknames field, parsed only on save
+  const [pendingKeep, setPendingKeep] = useState(null);
+  const [mergePicker, setMergePicker] = useState(false);
+  const [mergePreview, setMergePreview] = useState(null);
+  const [confirmRelease, setConfirmRelease] = useState(false);
+  const [undo, setUndo] = useState(null);
   const rec = useRef(null);
   const asked = useRef(false);
   const wantListening = useRef(false);
   const listenBase = useRef(""); // committed text: manual typing + everything finalized across restarts
+  const undoTimer = useRef(null);
+
+  // Keep the nicknames field's raw text in sync with whichever person is
+  // being edited, without ever reformatting it while the user is typing —
+  // that reformatting (splitting/rejoining on every keystroke) was what
+  // made commas hard to type in the first place.
+  useEffect(() => {
+    setAliasInput(editing ? (editing.aliases || []).join(", ") : "");
+  }, [editing?.id]);
 
   /* ── who's signed in ────────────────────────── */
   useEffect(() => {
@@ -76,6 +283,17 @@ export default function Noticed() {
   useEffect(() => {
     let current = true;
     asked.current = false;
+    // These hold in-progress decisions (an open edit sheet, a pending name
+    // confirmation, a merge in preview, an undo snapshot) — none of them
+    // should ever survive a switch to a different account.
+    setEditing(null);
+    setAliasInput("");
+    setPendingKeep(null);
+    setMergePicker(false);
+    setMergePreview(null);
+    setConfirmRelease(false);
+    setUndo(null);
+    if (undoTimer.current) clearTimeout(undoTimer.current);
     if (!session) {
       setDb(BLANK_DB);
       setLoaded(false);
@@ -95,7 +313,7 @@ export default function Noticed() {
         // Don't fall back to a blank db here — that would look identical to
         // "brand new user" and silently walk an existing user back through
         // onboarding, which then overwrites their real saved data.
-        setLoadError(e?.message || "Couldn't load your data.");
+        setLoadError(friendlyError(e));
       }
     })();
     return () => { current = false; };
@@ -108,7 +326,7 @@ export default function Noticed() {
       await saveState(session.user.id, next);
       setSaveError("");
     } catch (e) {
-      setSaveError(e?.message || "Couldn't save just now.");
+      setSaveError(friendlyError(e));
     }
   };
 
@@ -227,16 +445,18 @@ export default function Noticed() {
     const text = transcript.trim();
     if (!text) return;
     setWorking("Keeping it…");
-    const known = db.people.map((p) => `${p.name}${p.label ? ` [${p.label}]` : ""} (${p.who})`).join("; ") || "none yet";
+    const known = db.people
+      .map((p) => `${p.name}${p.label ? ` [${p.label}]` : ""}${p.aliases?.length ? ` (also called ${p.aliases.join(", ")})` : ""} (${p.who})`)
+      .join("; ") || "none yet";
     try {
-      const out = await ask(`Someone spoke about their week. Pull out the people in it.
+      const out = await ask(`I'm telling you about my week. Pull out the people I mentioned.
 
 Already known: ${known}
 Today: ${TODAY()}
-What they said:
+What I said:
 """${text}"""
 
-Match to known people where obvious. Keep every field short, in the speaker's own plain words. Never invent detail.
+Keep every field short, written in my own plain words, first person (I, me, my). Never refer to me as "the speaker" or by name. Never invent detail.
 "threads" = specific true things worth remembering, human and verbatim ish, not blandly summarised.
 "hardDates" = anniversaries of painful things others forget. YYYY-MM-DD, only if implied.
 "upcoming" = a specific thing about to happen to them, with rough date.
@@ -245,38 +465,67 @@ Never use hyphens or dashes anywhere. Use commas or separate sentences.
 ONLY JSON:
 {"people":[{"name":"","who":"","carries":"","loves":"","threads":[""],"sawThem":true,"upcoming":[{"what":"","when":"YYYY-MM-DD"}],"hardDates":[{"what":"","date":"YYYY-MM-DD"}]}]}`);
 
-      const people = [...db.people];
+      // Identity resolution happens here, not in the prompt: exact matches
+      // (name, label, or a saved alias) merge immediately; a close-but-not-exact
+      // spelling is only ever offered for confirmation, never merged on its own.
+      let people = [...db.people];
       const names = [];
+      const queue = [];
       (out.people || []).forEach((f) => {
-        names.push(f.name);
-        const i = people.findIndex((p) => p.name.toLowerCase() === (f.name || "").toLowerCase());
-        if (i >= 0) {
-          const p = people[i];
-          people[i] = {
-            ...p,
-            who: p.who || f.who,
-            carries: f.carries || p.carries,
-            loves: [p.loves, f.loves].filter(Boolean).join(", "),
-            threads: [...(p.threads || []), ...(f.threads || [])].slice(-30),
-            last: f.sawThem ? new Date().toISOString() : p.last,
-            upcoming: [...(p.upcoming || []), ...(f.upcoming || [])],
-            hardDates: [...(p.hardDates || []), ...(f.hardDates || [])],
-          };
+        if (!f.name) return;
+        const exactIdx = findExactPersonIndex(people, f.name);
+        if (exactIdx >= 0) {
+          people[exactIdx] = mergeIntoPerson(people[exactIdx], f);
+          names.push(people[exactIdx].label || people[exactIdx].name);
+          return;
+        }
+        const candidate = findBestCandidate(people, f.name);
+        if (candidate) {
+          queue.push({ extracted: f, candidateId: candidate.person.id, candidateName: candidate.person.label || candidate.person.name });
         } else {
-          people.push({
-            id: `p-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            name: f.name, who: f.who || "", label: "", carries: f.carries || "", loves: f.loves || "",
-            threads: f.threads || [], birthday: "",
-            last: f.sawThem ? new Date().toISOString() : new Date(Date.now() - 14 * 864e5).toISOString(),
-            upcoming: f.upcoming || [], hardDates: f.hardDates || [],
-          });
+          const np = newPerson(f);
+          people.push(np);
+          names.push(np.name);
         }
       });
+
+      if (queue.length) {
+        setWorking("");
+        setPendingKeep({ text, people, queue, idx: 0, names });
+        return;
+      }
+
       await persist({ ...db, people, weeks: [...db.weeks, { at: TODAY(), text }] });
       setTranscript(""); setWorking(""); setKept(names);
     } catch (e) {
       console.error(e); setWorking("Hm, that didn't land: " + (e?.message || "unknown") + ". Try again.");
     }
+  };
+
+  const resolvePending = async (isMatch) => {
+    const { text, people, queue, idx, names } = pendingKeep;
+    const item = queue[idx];
+    let nextPeople = people;
+    let nextNames = names;
+    if (isMatch) {
+      const i = nextPeople.findIndex((p) => p.id === item.candidateId);
+      nextPeople = [...nextPeople];
+      nextPeople[i] = mergeIntoPerson(nextPeople[i], item.extracted, item.extracted.name);
+      nextNames = [...nextNames, nextPeople[i].label || nextPeople[i].name];
+    } else {
+      const np = newPerson(item.extracted);
+      nextPeople = [...nextPeople, np];
+      nextNames = [...nextNames, np.name];
+    }
+    const nextIdx = idx + 1;
+    if (nextIdx < queue.length) {
+      setPendingKeep({ text, people: nextPeople, queue, idx: nextIdx, names: nextNames });
+      return;
+    }
+    setPendingKeep(null);
+    setWorking("Keeping it…");
+    await persist({ ...db, people: nextPeople, weeks: [...db.weeks, { at: TODAY(), text }] });
+    setWorking(""); setKept(nextNames); setTranscript("");
   };
 
   /* ── triggers ───────────────────────────── */
@@ -363,10 +612,62 @@ ONLY JSON:
     setNote("");
   };
 
-  const saveEdit = async () => {
-    const people = db.people.map((p) => (p.id === editing.id ? editing : p));
-    await persist({ ...db, people });
+  // Opening/closing the edit sheet always resets any in-progress merge or
+  // release attempt — otherwise a choice made for one person could linger
+  // and get shown against a different one later.
+  const openEditing = (p) => {
+    setEditing(p);
+    setMergePicker(false);
+    setMergePreview(null);
+    setConfirmRelease(false);
+  };
+  const closeEditing = () => {
     setEditing(null);
+    setMergePicker(false);
+    setMergePreview(null);
+    setConfirmRelease(false);
+  };
+
+  const saveEdit = async () => {
+    const people = db.people.map((p) => (p.id === editing.id ? { ...editing, aliases: parseAliases(aliasInput) } : p));
+    await persist({ ...db, people });
+    closeEditing();
+  };
+
+  /* ── merge two people ──────────────────────── */
+  const confirmMerge = async () => {
+    const primary = editing;
+    const other = mergePreview;
+    const merged = mergePeople(primary, other);
+    const snapshot = { people: db.people, gesture: db.gesture, message: "Merged." };
+    const nextPeople = db.people.filter((p) => p.id !== other.id).map((p) => (p.id === primary.id ? merged : p));
+    const nextGesture = db.gesture?.personId === other.id ? { ...db.gesture, personId: primary.id } : db.gesture;
+    await persist({ ...db, people: nextPeople, gesture: nextGesture });
+    if (undoTimer.current) clearTimeout(undoTimer.current);
+    setUndo(snapshot);
+    undoTimer.current = setTimeout(() => setUndo(null), 10000);
+    closeEditing();
+  };
+
+  const handleUndo = async () => {
+    if (undoTimer.current) clearTimeout(undoTimer.current);
+    const restored = undo;
+    setUndo(null);
+    await persist({ ...db, people: restored.people, gesture: restored.gesture });
+  };
+
+  /* ── release a person ──────────────────────── */
+  const releasePerson = async () => {
+    const person = editing;
+    const name = person.label || person.name;
+    const snapshot = { people: db.people, gesture: db.gesture, message: `${name} has been released. Space for other memories now.` };
+    const nextPeople = db.people.filter((p) => p.id !== person.id);
+    const nextGesture = db.gesture?.personId === person.id ? null : db.gesture;
+    await persist({ ...db, people: nextPeople, gesture: nextGesture });
+    if (undoTimer.current) clearTimeout(undoTimer.current);
+    setUndo(snapshot);
+    undoTimer.current = setTimeout(() => setUndo(null), 10000);
+    closeEditing();
   };
 
   /* ── styles ─────────────────────────────── */
@@ -477,7 +778,7 @@ ONLY JSON:
             disabled={!nameInput.trim() || !firstPerson.trim()}
             onClick={async () => {
               const seed = firstPerson.trim()
-                ? [{ id: `p-${Date.now()}`, name: firstPerson.trim(), who: "", label: "", carries: "", loves: "", threads: [], birthday: "", last: new Date().toISOString(), upcoming: [], hardDates: [] }]
+                ? [{ id: `p-${Date.now()}`, name: firstPerson.trim(), who: "", label: "", carries: "", loves: "", threads: [], birthday: "", aliases: [], last: new Date().toISOString(), upcoming: [], hardDates: [] }]
                 : [];
               await persist({ ...db, user: nameInput.trim(), onboarded: true, people: seed });
               setView("keep");
@@ -495,8 +796,31 @@ ONLY JSON:
   const hour = new Date().getHours();
   const timeword = hour < 12 ? "Morning" : hour < 18 ? "Afternoon" : "Evening";
 
+  /* ── NAME CONFIRMATION ─────────────────────
+     A close but not exact name match — never merged without this. ── */
+  if (pendingKeep) {
+    const item = pendingKeep.queue[pendingKeep.idx];
+    return (
+      <div style={S.shell}>
+        <style>{`@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500&display=swap');input::placeholder{color:#B0A692}`}</style>
+        <header style={S.head}><div style={S.mark}>Noticed</div></header>
+        <div style={S.card}>
+          <div style={S.eyebrow}>
+            {pendingKeep.queue.length > 1 ? `One thing — ${pendingKeep.idx + 1} of ${pendingKeep.queue.length}` : "One thing"}
+          </div>
+          <div style={{ ...S.serif, marginBottom: 14 }}>Did you mean {item.candidateName}?</div>
+          <div style={S.body}>You mentioned "{item.extracted.name}" — is that the same person as {item.candidateName}, just spelled or said differently?</div>
+          <button style={S.primary} onClick={() => resolvePending(true)}>Yes, same person</button>
+          <button style={S.ghost} onClick={() => resolvePending(false)}>No, someone new</button>
+        </div>
+      </div>
+    );
+  }
+
   /* ── EDIT SHEET ─────────────────────────── */
   if (editing) {
+    const displayName = editing.label || editing.name; // the one name shown everywhere
+    const otherDisplayName = mergePreview ? (mergePreview.label || mergePreview.name) : "";
     return (
       <div style={S.shell}>
         <style>{`@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500&display=swap');input::placeholder{color:#B0A692}`}</style>
@@ -505,15 +829,74 @@ ONLY JSON:
           <div style={S.eyebrow}>Their details</div>
           <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>Name</div>
           <input style={S.inp} value={editing.name} onChange={(e) => setEditing({ ...editing, name: e.target.value })} />
-          <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>What you call them (bestie, bro, mama…)</div>
+          <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>What you call them — if set, this is shown everywhere instead of their name</div>
           <input style={S.inp} placeholder="optional, a personal name" value={editing.label || ""} onChange={(e) => setEditing({ ...editing, label: e.target.value })} />
+          <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>Other names or nicknames (separate with commas, periods, or spaces)</div>
+          <input
+            style={S.inp}
+            placeholder="other names you call them"
+            value={aliasInput}
+            onChange={(e) => setAliasInput(e.target.value)}
+          />
           <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>Who they are to you</div>
           <input style={S.inp} value={editing.who} onChange={(e) => setEditing({ ...editing, who: e.target.value })} />
           <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>Birthday</div>
           <input style={S.inp} type="date" value={editing.birthday || ""} onChange={(e) => setEditing({ ...editing, birthday: e.target.value })} />
           <button style={S.primary} onClick={saveEdit}>Save</button>
-          <button style={S.ghost} onClick={() => setEditing(null)}>Cancel</button>
+          <button style={S.ghost} onClick={closeEditing}>Cancel</button>
           {saveError && <div style={{ ...S.body, color: EMBER, fontSize: 12.5, marginTop: 14 }}>{saveError}</div>}
+
+          {db.people.length > 1 && !mergePicker && !mergePreview && (
+            <button style={{ ...S.ghost, marginTop: 22, borderTop: `1px solid ${LINE}`, paddingTop: 20 }} onClick={() => setMergePicker(true)}>
+              Merge with someone else…
+            </button>
+          )}
+
+          {mergePicker && (
+            <div style={{ marginTop: 22, borderTop: `1px solid ${LINE}`, paddingTop: 20 }}>
+              <div style={S.eyebrow}>Merge {displayName} with</div>
+              {db.people.filter((p) => p.id !== editing.id).map((p) => (
+                <div key={p.id} style={S.row} onClick={() => { setMergePreview(p); setMergePicker(false); }}>
+                  <div>{p.label || p.name}</div>
+                </div>
+              ))}
+              <button style={S.ghost} onClick={() => setMergePicker(false)}>Cancel</button>
+            </div>
+          )}
+
+          {mergePreview && (
+            <div style={{ marginTop: 22, borderTop: `1px solid ${LINE}`, paddingTop: 20 }}>
+              <div style={S.eyebrow}>Merging {otherDisplayName} into {displayName}</div>
+              <div style={S.body}>
+                Combines {mergePreview.threads?.length || 0} thing{(mergePreview.threads?.length || 0) === 1 ? "" : "s"} remembered,{" "}
+                {mergePreview.upcoming?.length || 0} upcoming, {mergePreview.hardDates?.length || 0} hard date{(mergePreview.hardDates?.length || 0) === 1 ? "" : "s"}.
+                Nothing is deleted, everything combines into one person, and {otherDisplayName} still matches next time, remembered invisibly.
+              </div>
+              {mergePreview.birthday && editing.birthday && mergePreview.birthday !== editing.birthday && (
+                <div style={{ ...S.body, color: EMBER, marginTop: 10, fontSize: 12.5 }}>
+                  They have different birthdays saved — make sure these are really the same person before merging.
+                </div>
+              )}
+              <button style={S.primary} onClick={confirmMerge}>Merge {otherDisplayName} into {displayName}</button>
+              <button style={S.ghost} onClick={() => setMergePreview(null)}>Cancel</button>
+            </div>
+          )}
+
+          {!mergePicker && !mergePreview && !confirmRelease && (
+            <button style={{ ...S.ghost, marginTop: 22, borderTop: `1px solid ${LINE}`, paddingTop: 20, color: EMBER }} onClick={() => setConfirmRelease(true)}>
+              Release {displayName}
+            </button>
+          )}
+
+          {confirmRelease && (
+            <div style={{ marginTop: 22, borderTop: `1px solid ${LINE}`, paddingTop: 20 }}>
+              <div style={{ ...S.body, color: EMBER, fontSize: 12.5, marginBottom: 12 }}>
+                Let {displayName} go? Everything kept for them will be removed from your account. This can't be undone after a little while.
+              </div>
+              <button style={{ ...S.primary, background: EMBER }} onClick={releasePerson}>Yes, release them</button>
+              <button style={S.ghost} onClick={() => setConfirmRelease(false)}>Cancel</button>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -542,12 +925,19 @@ ONLY JSON:
         </div>
       )}
 
+      {undo && (
+        <div style={{ margin: "0 20px 16px", padding: "10px 14px", background: "#7A5C6E14", border: `1px solid ${DEEP}`, borderRadius: 4, color: DEEP, fontSize: 12.5, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span>{undo.message}</span>
+          <button style={{ background: "none", border: "none", color: DEEP, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", fontSize: 12.5 }} onClick={handleUndo}>Undo</button>
+        </div>
+      )}
+
       {view === "keep" && !kept && (
         <div style={S.card}>
           <div style={S.greet}>{timeword}, {db.user}.</div>
           {db.people.length === 1 && !(db.people[0].threads || []).length ? (
             <div style={{ ...S.serif, margin: "10px 0 24px", color: INK_SOFT }}>
-              Tell me about {db.people[0].name}. What's happening with them lately?
+              Tell me about {db.people[0].label || db.people[0].name}. What's happening with them lately?
             </div>
           ) : (
             <div style={{ ...S.serif, margin: "10px 0 24px", color: INK_SOFT }}>Who was on your heart?</div>
@@ -616,10 +1006,10 @@ ONLY JSON:
         <div style={S.card}>
           <div style={S.eyebrow}>{db.people.length ? "Your people" : "Nobody yet"}</div>
           {db.people.map((p) => (
-            <div key={p.id} style={S.row} onClick={() => setEditing(p)}>
+            <div key={p.id} style={S.row} onClick={() => openEditing(p)}>
               <div style={{ paddingRight: 14 }}>
                 <div style={{ fontSize: 17, marginBottom: 3, fontFamily: "'Instrument Serif',Georgia,serif" }}>
-                  {p.label || p.name}{p.label && <span style={{ fontSize: 12.5, color: FAINT, fontFamily: "'Inter'" }}>  · {p.name}</span>}
+                  {p.label || p.name}
                 </div>
                 <div style={{ fontSize: 12.5, color: FAINT, lineHeight: 1.45 }}>{p.who}</div>
                 {p.birthday && <div style={{ fontSize: 12, color: DEEP, marginTop: 4 }}>🎂 {new Date(p.birthday).toLocaleDateString(undefined, { month: "long", day: "numeric" })}</div>}
