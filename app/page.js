@@ -48,7 +48,45 @@ function joinFragments(raw) {
   return joined.charAt(0).toUpperCase() + joined.slice(1) + ".";
 }
 const TODAY = () => new Date().toISOString().slice(0, 10);
-const BLANK_DB = { people: [], weeks: [], gesture: null, restedOn: null, user: null, onboarded: false };
+const BLANK_DB = { people: [], memories: [], interactions: [], weeks: [], gesture: null, restedOn: null, user: null, onboarded: false };
+
+const genId = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+// Turns a fresh capture's "threads" for one person into dated, addressable
+// memory records, linked back to the raw week entry they came from.
+function memoriesFromExtraction(personId, threads, date, sourceWeekId) {
+  return (threads || []).filter(Boolean).map((text) => ({ id: genId("m"), personIds: [personId], date, text, sourceWeekId }));
+}
+
+function makeInteraction(personId, kind, note, gestureId) {
+  return { id: genId("i"), personId, date: new Date().toISOString(), kind, note: note || null, gestureId: gestureId || null };
+}
+
+// `last`/`lastMentioned` are derived, not stored, so nothing is ever
+// overwritten in place and no history is lost.
+function lastContactOf(db, personId) {
+  let latest = null;
+  (db.interactions || []).forEach((i) => {
+    if (i.personId !== personId || i.kind !== "contact") return;
+    if (!latest || new Date(i.date).getTime() > new Date(latest).getTime()) latest = i.date;
+  });
+  return latest;
+}
+
+function lastMentionedOf(db, personId) {
+  let latest = null;
+  (db.memories || []).forEach((m) => {
+    if (!m.personIds?.includes(personId)) return;
+    if (!latest || new Date(m.date).getTime() > new Date(latest).getTime()) latest = m.date;
+  });
+  return latest;
+}
+
+function memoriesFor(db, personId) {
+  return (db.memories || [])
+    .filter((m) => m.personIds?.includes(personId))
+    .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+}
 
 /* ── name matching ──────────────────────────────────
    Identity resolution lives here, in inspectable code, not
@@ -123,10 +161,9 @@ function findBestCandidate(people, name) {
 
 function newPerson(f) {
   return {
-    id: `p-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    id: genId("p"),
     name: f.name, who: f.who || "", label: "", carries: f.carries || "", loves: f.loves || "",
-    threads: f.threads || [], birthday: "", aliases: [],
-    last: f.sawThem ? new Date().toISOString() : new Date(Date.now() - 14 * 864e5).toISOString(),
+    birthday: "", aliases: [], createdAt: new Date().toISOString(),
     upcoming: f.upcoming || [], hardDates: f.hardDates || [],
   };
 }
@@ -134,7 +171,9 @@ function newPerson(f) {
 // Merges a fresh mention `f` (from the engine's extraction) into an existing
 // person `p`. `learnAlias`, when given, is the exact spelling that was just
 // confirmed to refer to `p` — it's remembered so the same spelling auto
-// matches next time without asking again.
+// matches next time without asking again. `f.threads`/`f.sawThem` are handled
+// by the caller now, since they become memory/interaction records, not fields
+// on the person.
 function mergeIntoPerson(p, f, learnAlias) {
   const aliases = [...(p.aliases || [])];
   if (learnAlias) {
@@ -146,8 +185,6 @@ function mergeIntoPerson(p, f, learnAlias) {
     who: p.who || f.who,
     carries: f.carries || p.carries,
     loves: [p.loves, f.loves].filter(Boolean).join(", "),
-    threads: [...(p.threads || []), ...(f.threads || [])].slice(-30),
-    last: f.sawThem ? new Date().toISOString() : p.last,
     upcoming: [...(p.upcoming || []), ...(f.upcoming || [])],
     hardDates: [...(p.hardDates || []), ...(f.hardDates || [])],
     aliases,
@@ -165,24 +202,6 @@ function combineText(a, b) {
   if (!at) return bt;
   if (!bt || at.toLowerCase() === bt.toLowerCase()) return at;
   return `${at} ${bt}`;
-}
-
-function laterOf(a, b) {
-  if (!a) return b;
-  if (!b) return a;
-  return new Date(a).getTime() >= new Date(b).getTime() ? a : b;
-}
-
-function dedupeStrings(arr) {
-  const seen = new Set();
-  const out = [];
-  (arr || []).forEach((s) => {
-    const t = (s || "").trim();
-    if (!t || seen.has(t.toLowerCase())) return;
-    seen.add(t.toLowerCase());
-    out.push(t);
-  });
-  return out;
 }
 
 function dedupeEvents(arr, dateKey) {
@@ -221,9 +240,8 @@ function mergePeople(primary, other) {
     who: combineText(primary.who, other.who),
     carries: combineText(primary.carries, other.carries),
     loves: [primary.loves, other.loves].filter(Boolean).join(", "),
-    threads: dedupeStrings([...(primary.threads || []), ...(other.threads || [])]),
     birthday: primary.birthday || other.birthday || "",
-    last: laterOf(primary.last, other.last),
+    phone: primary.phone || other.phone || "",
     upcoming: dedupeEvents([...(primary.upcoming || []), ...(other.upcoming || [])], "when"),
     hardDates: dedupeEvents([...(primary.hardDates || []), ...(other.hardDates || [])], "date"),
     aliases,
@@ -336,7 +354,11 @@ export default function Noticed() {
       try {
         const saved = await loadState(session.user.id);
         if (!current) return; // a newer sign in has since superseded this fetch
-        setDb(saved || BLANK_DB);
+        // Merge onto BLANK_DB, not just `saved || BLANK_DB`: a saved row from
+        // before the memories/interactions split won't have those keys at
+        // all, and this is the one place loaded data crosses into the app,
+        // so it's the right place to guarantee the shape.
+        setDb(saved ? { ...BLANK_DB, ...saved } : BLANK_DB);
         setLoaded(true);
       } catch (e) {
         if (!current) return;
@@ -499,13 +521,19 @@ ONLY JSON:
       // (name, label, or a saved alias) merge immediately; a close-but-not-exact
       // spelling is only ever offered for confirmation, never merged on its own.
       let people = [...db.people];
+      let memories = [];
+      let interactions = [];
       const names = [];
       const queue = [];
+      const weekId = genId("w");
+      const date = TODAY();
       (out.people || []).forEach((f) => {
         if (!f.name) return;
         const exactIdx = findExactPersonIndex(people, f.name);
         if (exactIdx >= 0) {
           people[exactIdx] = mergeIntoPerson(people[exactIdx], f);
+          memories.push(...memoriesFromExtraction(people[exactIdx].id, f.threads, date, weekId));
+          if (f.sawThem) interactions.push(makeInteraction(people[exactIdx].id, "contact"));
           names.push(people[exactIdx].label || people[exactIdx].name);
           return;
         }
@@ -515,17 +543,19 @@ ONLY JSON:
         } else {
           const np = newPerson(f);
           people.push(np);
+          memories.push(...memoriesFromExtraction(np.id, f.threads, date, weekId));
+          if (f.sawThem) interactions.push(makeInteraction(np.id, "contact"));
           names.push(np.name);
         }
       });
 
       if (queue.length) {
         setWorking("");
-        setPendingKeep({ text, people, queue, idx: 0, names });
+        setPendingKeep({ text, people, queue, idx: 0, names, memories, interactions, weekId, date });
         return;
       }
 
-      await persist({ ...db, people, weeks: [...db.weeks, { at: TODAY(), text }] });
+      await persist({ ...db, people, memories: [...db.memories, ...memories], interactions: [...db.interactions, ...interactions], weeks: [...db.weeks, { id: weekId, at: date, text }] });
       setTranscript(""); setWorking(""); setKept(names);
     } catch (e) {
       console.error(e); setWorking("Hm, that didn't land: " + (e?.message || "unknown") + ". Try again.");
@@ -533,28 +563,34 @@ ONLY JSON:
   };
 
   const resolvePending = async (isMatch) => {
-    const { text, people, queue, idx, names } = pendingKeep;
+    const { text, people, queue, idx, names, memories, interactions, weekId, date } = pendingKeep;
     const item = queue[idx];
     let nextPeople = people;
     let nextNames = names;
+    let nextMemories = memories;
+    let nextInteractions = interactions;
     if (isMatch) {
       const i = nextPeople.findIndex((p) => p.id === item.candidateId);
       nextPeople = [...nextPeople];
       nextPeople[i] = mergeIntoPerson(nextPeople[i], item.extracted, item.extracted.name);
+      nextMemories = [...nextMemories, ...memoriesFromExtraction(nextPeople[i].id, item.extracted.threads, date, weekId)];
+      if (item.extracted.sawThem) nextInteractions = [...nextInteractions, makeInteraction(nextPeople[i].id, "contact")];
       nextNames = [...nextNames, nextPeople[i].label || nextPeople[i].name];
     } else {
       const np = newPerson(item.extracted);
       nextPeople = [...nextPeople, np];
+      nextMemories = [...nextMemories, ...memoriesFromExtraction(np.id, item.extracted.threads, date, weekId)];
+      if (item.extracted.sawThem) nextInteractions = [...nextInteractions, makeInteraction(np.id, "contact")];
       nextNames = [...nextNames, np.name];
     }
     const nextIdx = idx + 1;
     if (nextIdx < queue.length) {
-      setPendingKeep({ text, people: nextPeople, queue, idx: nextIdx, names: nextNames });
+      setPendingKeep({ text, people: nextPeople, queue, idx: nextIdx, names: nextNames, memories: nextMemories, interactions: nextInteractions, weekId, date });
       return;
     }
     setPendingKeep(null);
     setWorking("Keeping it…");
-    await persist({ ...db, people: nextPeople, weeks: [...db.weeks, { at: TODAY(), text }] });
+    await persist({ ...db, people: nextPeople, memories: [...db.memories, ...nextMemories], interactions: [...db.interactions, ...nextInteractions], weeks: [...db.weeks, { id: weekId, at: date, text }] });
     setWorking(""); setKept(nextNames); setTranscript("");
   };
 
@@ -565,7 +601,7 @@ ONLY JSON:
     let best = null;
     db.people.forEach((p) => {
       let score = Math.random() * 8, reason = "no reason at all", kind = "open";
-      const drift = DAYS(p.last);
+      const drift = DAYS(lastContactOf(db, p.id) || p.createdAt);
       if (drift > 10) { score = Math.min(drift, 60); reason = `${drift} days of quiet`; kind = "drift"; }
       if (p.birthday) {
         const b = new Date(p.birthday); b.setFullYear(new Date().getFullYear());
@@ -600,8 +636,8 @@ Person: ${p.name}${p.label ? ` (the user calls them "${p.label}")` : ""}
 Who they are: ${p.who}
 Carrying: ${p.carries}
 Loves: ${p.loves}
-Recent true things they've said or done: ${(p.threads || []).slice(-6).join(" / ") || "nothing yet"}
-Days since contact: ${DAYS(p.last)}
+Recent true things they've said or done: ${memoriesFor(db, p.id).slice(-6).map((m) => m.text).join(" / ") || "nothing yet"}
+Days since contact: ${DAYS(lastContactOf(db, p.id) || p.createdAt)}
 Why now: ${t.reason} (trigger: ${t.kind})
 
 CRITICAL: you never write the message for them. Hand them the noticing; the words stay theirs. Do not produce a sendable text.
@@ -633,13 +669,19 @@ ONLY JSON:
   }, [view, loaded, db.people.length, db.onboarded]);
 
   const done = async () => {
-    const people = db.people.map((p) =>
-      p.id === db.gesture.personId
-        ? { ...p, last: new Date().toISOString(), threads: note ? [...(p.threads || []), note] : p.threads }
-        : p
-    );
-    await persist({ ...db, people, gesture: null, restedOn: TODAY() });
+    const personId = db.gesture.personId;
+    const trimmed = note.trim();
+    const interaction = makeInteraction(personId, "contact", trimmed, db.gesture.date);
+    const memories = trimmed
+      ? [...db.memories, { id: genId("m"), personIds: [personId], date: TODAY(), text: trimmed, sourceWeekId: null }]
+      : db.memories;
+    await persist({ ...db, memories, interactions: [...db.interactions, interaction], gesture: null, restedOn: TODAY() });
     setNote("");
+  };
+
+  const restToday = async () => {
+    const interaction = makeInteraction(db.gesture.personId, "rested", null, db.gesture.date);
+    await persist({ ...db, interactions: [...db.interactions, interaction], gesture: null, restedOn: TODAY() });
   };
 
   // Opening/closing the edit sheet always resets any in-progress merge or
@@ -669,10 +711,16 @@ ONLY JSON:
     const primary = editing;
     const other = mergePreview;
     const merged = mergePeople(primary, other);
-    const snapshot = { people: db.people, gesture: db.gesture, message: "Merged." };
+    const snapshot = { people: db.people, memories: db.memories, interactions: db.interactions, gesture: db.gesture, message: "Merged." };
     const nextPeople = db.people.filter((p) => p.id !== other.id).map((p) => (p.id === primary.id ? merged : p));
+    const nextMemories = db.memories.map((m) =>
+      m.personIds.includes(other.id)
+        ? { ...m, personIds: [...new Set(m.personIds.map((id) => (id === other.id ? primary.id : id)))] }
+        : m
+    );
+    const nextInteractions = db.interactions.map((i) => (i.personId === other.id ? { ...i, personId: primary.id } : i));
     const nextGesture = db.gesture?.personId === other.id ? { ...db.gesture, personId: primary.id } : db.gesture;
-    await persist({ ...db, people: nextPeople, gesture: nextGesture });
+    await persist({ ...db, people: nextPeople, memories: nextMemories, interactions: nextInteractions, gesture: nextGesture });
     if (undoTimer.current) clearTimeout(undoTimer.current);
     setUndo(snapshot);
     undoTimer.current = setTimeout(() => setUndo(null), 10000);
@@ -683,17 +731,21 @@ ONLY JSON:
     if (undoTimer.current) clearTimeout(undoTimer.current);
     const restored = undo;
     setUndo(null);
-    await persist({ ...db, people: restored.people, gesture: restored.gesture });
+    await persist({ ...db, people: restored.people, memories: restored.memories, interactions: restored.interactions, gesture: restored.gesture });
   };
 
   /* ── release a person ──────────────────────── */
   const releasePerson = async () => {
     const person = editing;
     const name = person.label || person.name;
-    const snapshot = { people: db.people, gesture: db.gesture, message: `${name} has been released. Space for other memories now.` };
+    const snapshot = { people: db.people, memories: db.memories, interactions: db.interactions, gesture: db.gesture, message: `${name} has been released. Space for other memories now.` };
     const nextPeople = db.people.filter((p) => p.id !== person.id);
+    const nextMemories = db.memories
+      .map((m) => (m.personIds.includes(person.id) ? { ...m, personIds: m.personIds.filter((id) => id !== person.id) } : m))
+      .filter((m) => m.personIds.length > 0);
+    const nextInteractions = db.interactions.filter((i) => i.personId !== person.id);
     const nextGesture = db.gesture?.personId === person.id ? null : db.gesture;
-    await persist({ ...db, people: nextPeople, gesture: nextGesture });
+    await persist({ ...db, people: nextPeople, memories: nextMemories, interactions: nextInteractions, gesture: nextGesture });
     if (undoTimer.current) clearTimeout(undoTimer.current);
     setUndo(snapshot);
     undoTimer.current = setTimeout(() => setUndo(null), 10000);
@@ -815,7 +867,7 @@ ONLY JSON:
             disabled={!nameInput.trim() || !firstPerson.trim()}
             onClick={async () => {
               const seed = firstPerson.trim()
-                ? [{ id: `p-${Date.now()}`, name: firstPerson.trim(), who: "", label: "", carries: "", loves: "", threads: [], birthday: "", aliases: [], last: new Date().toISOString(), upcoming: [], hardDates: [] }]
+                ? [{ id: genId("p"), name: firstPerson.trim(), who: "", label: "", carries: "", loves: "", birthday: "", aliases: [], createdAt: new Date().toISOString(), upcoming: [], hardDates: [] }]
                 : [];
               await persist({ ...db, user: nameInput.trim(), onboarded: true, people: seed });
               setView("keep");
@@ -909,7 +961,7 @@ ONLY JSON:
             <div style={{ marginTop: 22, borderTop: `1px solid ${LINE}`, paddingTop: 20 }}>
               <div style={S.eyebrow}>Merging {otherDisplayName} into {displayName}</div>
               <div style={S.body}>
-                Combines {mergePreview.threads?.length || 0} thing{(mergePreview.threads?.length || 0) === 1 ? "" : "s"} remembered,{" "}
+                Combines {memoriesFor(db, mergePreview.id).length} thing{memoriesFor(db, mergePreview.id).length === 1 ? "" : "s"} remembered,{" "}
                 {mergePreview.upcoming?.length || 0} upcoming, {mergePreview.hardDates?.length || 0} hard date{(mergePreview.hardDates?.length || 0) === 1 ? "" : "s"}.
                 Nothing is deleted, everything combines into one person, and {otherDisplayName} still matches next time, remembered invisibly.
               </div>
@@ -976,7 +1028,7 @@ ONLY JSON:
       {view === "keep" && !kept && (
         <div style={S.card}>
           <div style={S.greet}>{timeword}, {db.user}.</div>
-          {db.people.length === 1 && !(db.people[0].threads || []).length ? (
+          {db.people.length === 1 && memoriesFor(db, db.people[0].id).length === 0 ? (
             <div style={{ ...S.serif, margin: "10px 0 24px", color: INK_SOFT }}>
               Tell me about {db.people[0].label || db.people[0].name}. What's happening with them lately?
             </div>
@@ -1032,7 +1084,7 @@ ONLY JSON:
                 ))}
               </div>
             )}
-            <button style={S.ghost} onClick={async () => await persist({ ...db, gesture: null, restedOn: TODAY() })}>Not today</button>
+            <button style={S.ghost} onClick={restToday}>Not today</button>
             <div style={S.noteRow}>
               <input style={S.noteInp} placeholder="If you do, tell me how it felt" value={note} onChange={(e) => setNote(e.target.value)} />
               {note.trim() && <button style={S.noteSave} onClick={done}>Save</button>}
@@ -1045,20 +1097,24 @@ ONLY JSON:
       {view === "people" && (
         <div style={S.card}>
           <div style={S.eyebrow}>{db.people.length ? "Your people" : "Nobody yet"}</div>
-          {db.people.map((p) => (
-            <div key={p.id} style={S.row} onClick={() => openEditing(p)}>
-              <div style={{ paddingRight: 14 }}>
-                <div style={{ fontSize: 17, marginBottom: 3, fontFamily: "'Instrument Serif',Georgia,serif" }}>
-                  {p.label || p.name}
+          {db.people.map((p) => {
+            const personMemories = memoriesFor(db, p.id);
+            const drift = DAYS(lastContactOf(db, p.id) || p.createdAt);
+            return (
+              <div key={p.id} style={S.row} onClick={() => openEditing(p)}>
+                <div style={{ paddingRight: 14 }}>
+                  <div style={{ fontSize: 17, marginBottom: 3, fontFamily: "'Instrument Serif',Georgia,serif" }}>
+                    {p.label || p.name}
+                  </div>
+                  <div style={{ fontSize: 12.5, color: FAINT, lineHeight: 1.45 }}>{p.who}</div>
+                  {p.birthday && <div style={{ fontSize: 12, color: DEEP, marginTop: 4 }}>🎂 {new Date(p.birthday).toLocaleDateString(undefined, { month: "long", day: "numeric" })}</div>}
+                  {p.hardDates?.length > 0 && <div style={{ fontSize: 12, color: DEEP, marginTop: 4 }}>{p.hardDates[0].what}</div>}
+                  {personMemories.length > 0 && <div style={{ fontSize: 12.5, color: INK_SOFT, marginTop: 6, fontStyle: "italic" }}>"{personMemories[personMemories.length - 1].text}"</div>}
                 </div>
-                <div style={{ fontSize: 12.5, color: FAINT, lineHeight: 1.45 }}>{p.who}</div>
-                {p.birthday && <div style={{ fontSize: 12, color: DEEP, marginTop: 4 }}>🎂 {new Date(p.birthday).toLocaleDateString(undefined, { month: "long", day: "numeric" })}</div>}
-                {p.hardDates?.length > 0 && <div style={{ fontSize: 12, color: DEEP, marginTop: 4 }}>{p.hardDates[0].what}</div>}
-                {p.threads?.length > 0 && <div style={{ fontSize: 12.5, color: INK_SOFT, marginTop: 6, fontStyle: "italic" }}>"{p.threads[p.threads.length - 1]}"</div>}
+                <div style={{ fontSize: 11, letterSpacing: "0.1em", color: drift > 21 ? DEEP : FAINT, whiteSpace: "nowrap" }}>{drift}d</div>
               </div>
-              <div style={{ fontSize: 11, letterSpacing: "0.1em", color: DAYS(p.last) > 21 ? DEEP : FAINT, whiteSpace: "nowrap" }}>{DAYS(p.last)}d</div>
-            </div>
-          ))}
+            );
+          })}
           {db.people.length > 0 && <div style={{ ...S.body, fontSize: 12, color: FAINT, marginTop: 14 }}>Tap anyone to add a nickname or their birthday.</div>}
         </div>
       )}
