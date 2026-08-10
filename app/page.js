@@ -1036,7 +1036,7 @@ ONLY JSON:
             <div style={{ ...S.serif, margin: "10px 0 24px", color: INK_SOFT }}>Who was on your heart?</div>
           )}
           {supported && (
-            <button style={S.mic(listening)} onClick={listening ? stop : listen}>{listening ? "Listening" : "Speak"}</button>
+            <button style={S.mic(listening)} onClick={listening ? stop : listen}>{listening ? "Listening" : "Hold to tell me"}</button>
           )}
           <textarea style={S.ta} placeholder={supported ? "…or type it, if you'd rather" : "Type what happened"} value={transcript} onChange={(e) => setTranscript(e.target.value)} />
           <div style={{ ...S.body, fontSize: 12.5, color: FAINT, marginTop: 12 }}>Nothing is asked of you here. People appear by being mentioned.</div>
