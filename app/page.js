@@ -17,25 +17,38 @@ const EMBER = "#B4603A";
 const DEEP = "#7A5C6E";
 
 const DAYS = (iso) => (iso ? Math.floor((Date.now() - new Date(iso).getTime()) / 864e5) : 999);
+
+// Real, native contact links only, never a prefilled message, never auto sent.
+// The app just opens the door to the person in whatever app the user picks.
+function contactOptions(phone) {
+  const digits = (phone || "").replace(/[^\d+]/g, "");
+  if (!digits) return [];
+  return [
+    { key: "message", label: "Message", href: `sms:${digits}` },
+    { key: "call", label: "Call", href: `tel:${digits}` },
+    { key: "whatsapp", label: "WhatsApp", href: `https://wa.me/${digits.replace(/^\+/, "").replace(/\D/g, "")}` },
+  ];
+}
+
+// worthNaming is meant to be a single fragment, but older saved gestures (or
+// an engine reply that doesn't follow the shape) may hand back several. If
+// so, read them as one gentle, flowing clause rather than a mashed together
+// or choppily punctuated list.
+function joinFragments(raw) {
+  const parts = (Array.isArray(raw) ? raw : [raw])
+    .map((s) => (s || "").trim().replace(/[.\s]+$/, ""))
+    .filter(Boolean);
+  if (!parts.length) return null;
+  const lowered = parts.map((p, i) => (i === 0 ? p : p.charAt(0).toLowerCase() + p.slice(1)));
+  const joined = lowered.length === 1
+    ? lowered[0]
+    : lowered.length === 2
+    ? `${lowered[0]} and ${lowered[1]}`
+    : `${lowered.slice(0, -1).join(", ")}, and ${lowered[lowered.length - 1]}`;
+  return joined.charAt(0).toUpperCase() + joined.slice(1) + ".";
+}
 const TODAY = () => new Date().toISOString().slice(0, 10);
 const BLANK_DB = { people: [], weeks: [], gesture: null, restedOn: null, user: null, onboarded: false };
-
-// Section labels for a gesture, worded as an offer rather than an instruction.
-// One is picked per label per gesture (at the moment it's generated) and then
-// stays fixed for the life of that gesture, so the wording doesn't shift under
-// the user while they're reading — only the next gesture gets a fresh pick.
-const GESTURE_LABELS = {
-  action: ["A gentle way in", "Perhaps", "One small thing", "A way toward them", "If it feels right"],
-  fragments: ["Worth naming", "Worth holding onto", "The things that matter here", "What's worth remembering"],
-  braver: ["If you're braver today", "If you have it in you", "A braver version"],
-  reflect: ["How did it land?", "How did it go?", "If you'd like to remember it"],
-};
-const pickLabels = () => ({
-  action: GESTURE_LABELS.action[Math.floor(Math.random() * GESTURE_LABELS.action.length)],
-  fragments: GESTURE_LABELS.fragments[Math.floor(Math.random() * GESTURE_LABELS.fragments.length)],
-  braver: GESTURE_LABELS.braver[Math.floor(Math.random() * GESTURE_LABELS.braver.length)],
-  reflect: GESTURE_LABELS.reflect[Math.floor(Math.random() * GESTURE_LABELS.reflect.length)],
-});
 
 /* ── name matching ──────────────────────────────────
    Identity resolution lives here, in inspectable code, not
@@ -224,7 +237,7 @@ function mergePeople(primary, other) {
 function friendlyError(e) {
   const msg = e?.message || "";
   if (!msg || /load failed|failed to fetch|network/i.test(msg)) {
-    return "A network problem — check your connection and try again.";
+    return "A network problem, check your connection and try again.";
   }
   return msg;
 }
@@ -598,15 +611,15 @@ Rules:
  The act must cost NOTHING. Words, presence, a memory named aloud.
  Emotional context over reminder. Not "it has been a while", the actual human thing.
  Never sentimental, greeting card, or therapy speak.
- "worthNaming" = 2 or 3 short fragments: the detail to mention, the memory to bring up, the thing not to say.
+ "worthNaming" = at most one short fragment, a detail worth mentioning if it comes up naturally. Use null if nothing fits, don't force it.
  Anniversary of something painful: do not perform sadness. Remembering is the gift.
  "why" is one quiet observational sentence, a small truth, not a notification.
  Refer to the person as "${callname}".
- Never use hyphens or dashes anywhere in your writing. Use commas, or separate sentences.
+ Never use a hyphen, en dash, or em dash anywhere in your writing, not even in a compound word. Use commas, or separate sentences.
 
 ONLY JSON:
-{"why":"","act":"","worthNaming":["",""],"deeper":"","object":null}`);
-      await persist({ ...db, gesture: { date: TODAY(), personId: p.id, name: callname, reason: t.reason, kind: t.kind, ...g, labels: pickLabels() } });
+{"why":"","act":"","worthNaming":null}`);
+      await persist({ ...db, gesture: { date: TODAY(), personId: p.id, name: callname, reason: t.reason, kind: t.kind, ...g } });
     } catch (e) { setWorking("The engine stumbled."); }
   };
 
@@ -709,6 +722,13 @@ ONLY JSON:
     inp: { width: "100%", background: "transparent", border: `1px solid ${LINE}`, borderRadius: 3, padding: "11px 13px", color: INK, fontSize: 14.5, fontFamily: "inherit", outline: "none", boxSizing: "border-box", marginBottom: 12 },
     row: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", padding: "16px 0", borderBottom: `1px solid ${LINE}`, cursor: "pointer" },
     dot: { width: 7, height: 7, borderRadius: "50%", display: "inline-block", margin: "0 5px" },
+    kept: { fontFamily: "'Instrument Serif',Georgia,serif", fontStyle: "italic", fontSize: 15, color: FAINT, marginBottom: 10 },
+    aside: { fontSize: 14, lineHeight: 1.6, color: INK_SOFT, fontStyle: "italic", marginTop: 14 },
+    contactRow: { display: "flex", gap: 8, marginTop: 22 },
+    contactBtn: { flex: 1, textAlign: "center", textDecoration: "none", background: "transparent", color: INK, border: `1px solid ${LINE}`, borderRadius: 999, padding: "12px 0", fontSize: 13, fontFamily: "inherit", cursor: "pointer", boxSizing: "border-box" },
+    noteRow: { display: "flex", alignItems: "center", gap: 10, marginTop: 22 },
+    noteInp: { flex: 1, background: "transparent", border: "none", borderBottom: `1px solid ${LINE}`, padding: "4px 0", color: INK_SOFT, fontSize: 13, fontStyle: "italic", fontFamily: "inherit", outline: "none" },
+    noteSave: { background: "none", border: "none", padding: 0, color: EMBER, fontSize: 12.5, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" },
   };
 
   if (!authChecked)
@@ -810,6 +830,8 @@ ONLY JSON:
   }
 
   const g = db.gesture?.date === TODAY() ? db.gesture : null;
+  const contacts = g ? contactOptions(db.people.find((p) => p.id === g.personId)?.phone) : [];
+  const worthNaming = g ? joinFragments(g.worthNaming) : null;
   const hour = new Date().getHours();
   const timeword = hour < 12 ? "Morning" : hour < 18 ? "Afternoon" : "Evening";
 
@@ -823,10 +845,10 @@ ONLY JSON:
         <header style={S.head}><div style={S.mark}>Noticed</div></header>
         <div style={S.card}>
           <div style={S.eyebrow}>
-            {pendingKeep.queue.length > 1 ? `One thing — ${pendingKeep.idx + 1} of ${pendingKeep.queue.length}` : "One thing"}
+            {pendingKeep.queue.length > 1 ? `One thing, ${pendingKeep.idx + 1} of ${pendingKeep.queue.length}` : "One thing"}
           </div>
           <div style={{ ...S.serif, marginBottom: 14 }}>Did you mean {item.candidateName}?</div>
-          <div style={S.body}>You mentioned "{item.extracted.name}" — is that the same person as {item.candidateName}, just spelled or said differently?</div>
+          <div style={S.body}>You mentioned "{item.extracted.name}", is that the same person as {item.candidateName}, just spelled or said differently?</div>
           <button style={S.primary} onClick={() => resolvePending(true)}>Yes, same person</button>
           <button style={S.ghost} onClick={() => resolvePending(false)}>No, someone new</button>
         </div>
@@ -846,7 +868,7 @@ ONLY JSON:
           <div style={S.eyebrow}>Their details</div>
           <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>Name</div>
           <input style={S.inp} value={editing.name} onChange={(e) => setEditing({ ...editing, name: e.target.value })} />
-          <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>What you call them — if set, this is shown everywhere instead of their name</div>
+          <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>What you call them, if set, this is shown everywhere instead of their name</div>
           <input style={S.inp} placeholder="optional, a personal name" value={editing.label || ""} onChange={(e) => setEditing({ ...editing, label: e.target.value })} />
           <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>Other names or nicknames (separate with commas, periods, or spaces)</div>
           <input
@@ -859,6 +881,8 @@ ONLY JSON:
           <input style={S.inp} value={editing.who} onChange={(e) => setEditing({ ...editing, who: e.target.value })} />
           <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>Birthday</div>
           <input style={S.inp} type="date" value={editing.birthday || ""} onChange={(e) => setEditing({ ...editing, birthday: e.target.value })} />
+          <div style={{ ...S.body, marginBottom: 4, color: FAINT, fontSize: 12 }}>Phone, optional, so Today can offer to call, message, or WhatsApp them</div>
+          <input style={S.inp} type="tel" placeholder="optional" value={editing.phone || ""} onChange={(e) => setEditing({ ...editing, phone: e.target.value })} />
           <button style={S.primary} onClick={saveEdit}>Save</button>
           <button style={S.ghost} onClick={closeEditing}>Cancel</button>
           {saveError && <div style={{ ...S.body, color: EMBER, fontSize: 12.5, marginTop: 14 }}>{saveError}</div>}
@@ -891,7 +915,7 @@ ONLY JSON:
               </div>
               {mergePreview.birthday && editing.birthday && mergePreview.birthday !== editing.birthday && (
                 <div style={{ ...S.body, color: EMBER, marginTop: 10, fontSize: 12.5 }}>
-                  They have different birthdays saved — make sure these are really the same person before merging.
+                  They have different birthdays saved, make sure these are really the same person before merging.
                 </div>
               )}
               <button style={S.primary} onClick={confirmMerge}>Merge {otherDisplayName} into {displayName}</button>
@@ -997,23 +1021,22 @@ ONLY JSON:
       {view === "today" && g && (
         <>
           <div style={{ ...S.card, animation: "fade .6s ease" }}>
-            <div style={{ ...S.eyebrow, color: g.kind === "anniversary" || g.kind === "birthday" ? DEEP : FAINT }}>
-              {g.kind === "anniversary" ? "Nobody else will remember today" : g.kind === "birthday" ? g.reason : g.kind === "event" ? "This is happening to them now" : g.kind === "drift" ? g.reason : "No reason at all"}
-            </div>
+            <div style={S.kept}>I kept this for you.</div>
             <div style={S.name}>{g.name}</div>
-            <div style={{ ...S.serif, marginTop: 8 }}>“{g.why}”</div>
-            <div style={S.label}>{g.labels?.action || GESTURE_LABELS.action[0]}</div>
-            <div style={S.body}>{g.act}</div>
-            <div style={S.label}>{g.labels?.fragments || GESTURE_LABELS.fragments[0]}</div>
-            {(g.worthNaming || []).map((w, i) => <div key={i} style={S.frag}>{w}</div>)}
-            <div style={{ ...S.body, fontSize: 12.5, color: FAINT, marginTop: 10, fontStyle: "italic" }}>The words are yours. This is only what's worth remembering.</div>
-            <div style={S.label}>{g.labels?.braver || GESTURE_LABELS.braver[0]}</div>
-            <div style={S.body}>{g.deeper}</div>
-            {g.object && (<><div style={{ ...S.label, color: FAINT }}>Or send something</div><div style={{ ...S.body, color: FAINT }}>{g.object}</div></>)}
-            <div style={S.label}>{g.labels?.reflect || GESTURE_LABELS.reflect[0]}</div>
-            <input style={{ ...S.ta, minHeight: 0, marginTop: 0, padding: "12px 14px" }} placeholder="However it went, if you'd like to remember it" value={note} onChange={(e) => setNote(e.target.value)} />
-            <button style={S.primary} onClick={done}>I did it</button>
+            <div style={{ ...S.serif, marginTop: 8 }}>{[g.why, g.act].filter(Boolean).join(" ")}</div>
+            {worthNaming && <div style={S.aside}>{worthNaming}</div>}
+            {contacts.length > 0 && (
+              <div style={S.contactRow}>
+                {contacts.map((c) => (
+                  <a key={c.key} href={c.href} style={S.contactBtn}>{c.label}</a>
+                ))}
+              </div>
+            )}
             <button style={S.ghost} onClick={async () => await persist({ ...db, gesture: null, restedOn: TODAY() })}>Not today</button>
+            <div style={S.noteRow}>
+              <input style={S.noteInp} placeholder="If you do, tell me how it felt" value={note} onChange={(e) => setNote(e.target.value)} />
+              {note.trim() && <button style={S.noteSave} onClick={done}>Save</button>}
+            </div>
           </div>
           <p style={{ ...S.body, padding: "4px 26px", fontSize: 12.5, color: FAINT }}>One person. Never a list. Never a guilt trip.</p>
         </>
