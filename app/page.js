@@ -20,6 +20,23 @@ const DAYS = (iso) => (iso ? Math.floor((Date.now() - new Date(iso).getTime()) /
 const TODAY = () => new Date().toISOString().slice(0, 10);
 const BLANK_DB = { people: [], weeks: [], gesture: null, restedOn: null, user: null, onboarded: false };
 
+// Section labels for a gesture, worded as an offer rather than an instruction.
+// One is picked per label per gesture (at the moment it's generated) and then
+// stays fixed for the life of that gesture, so the wording doesn't shift under
+// the user while they're reading — only the next gesture gets a fresh pick.
+const GESTURE_LABELS = {
+  action: ["A gentle way in", "Perhaps", "One small thing", "A way toward them", "If it feels right"],
+  fragments: ["Worth naming", "Worth holding onto", "The things that matter here", "What's worth remembering"],
+  braver: ["If you're braver today", "If you have it in you", "A braver version"],
+  reflect: ["How did it land?", "How did it go?", "If you'd like to remember it"],
+};
+const pickLabels = () => ({
+  action: GESTURE_LABELS.action[Math.floor(Math.random() * GESTURE_LABELS.action.length)],
+  fragments: GESTURE_LABELS.fragments[Math.floor(Math.random() * GESTURE_LABELS.fragments.length)],
+  braver: GESTURE_LABELS.braver[Math.floor(Math.random() * GESTURE_LABELS.braver.length)],
+  reflect: GESTURE_LABELS.reflect[Math.floor(Math.random() * GESTURE_LABELS.reflect.length)],
+});
+
 /* ── name matching ──────────────────────────────────
    Identity resolution lives here, in inspectable code, not
    in the LLM's own judgment — the model just extracts names;
@@ -589,7 +606,7 @@ Rules:
 
 ONLY JSON:
 {"why":"","act":"","worthNaming":["",""],"deeper":"","object":null}`);
-      await persist({ ...db, gesture: { date: TODAY(), personId: p.id, name: callname, reason: t.reason, kind: t.kind, ...g } });
+      await persist({ ...db, gesture: { date: TODAY(), personId: p.id, name: callname, reason: t.reason, kind: t.kind, ...g, labels: pickLabels() } });
     } catch (e) { setWorking("The engine stumbled."); }
   };
 
@@ -985,15 +1002,15 @@ ONLY JSON:
             </div>
             <div style={S.name}>{g.name}</div>
             <div style={{ ...S.serif, marginTop: 8 }}>“{g.why}”</div>
-            <div style={S.label}>What to do</div>
+            <div style={S.label}>{g.labels?.action || GESTURE_LABELS.action[0]}</div>
             <div style={S.body}>{g.act}</div>
-            <div style={S.label}>Worth naming</div>
+            <div style={S.label}>{g.labels?.fragments || GESTURE_LABELS.fragments[0]}</div>
             {(g.worthNaming || []).map((w, i) => <div key={i} style={S.frag}>{w}</div>)}
             <div style={{ ...S.body, fontSize: 12.5, color: FAINT, marginTop: 10, fontStyle: "italic" }}>The words are yours. This is only what's worth remembering.</div>
-            <div style={S.label}>If you're braver today</div>
+            <div style={S.label}>{g.labels?.braver || GESTURE_LABELS.braver[0]}</div>
             <div style={S.body}>{g.deeper}</div>
             {g.object && (<><div style={{ ...S.label, color: FAINT }}>Or send something</div><div style={{ ...S.body, color: FAINT }}>{g.object}</div></>)}
-            <div style={S.label}>How did it land?</div>
+            <div style={S.label}>{g.labels?.reflect || GESTURE_LABELS.reflect[0]}</div>
             <input style={{ ...S.ta, minHeight: 0, marginTop: 0, padding: "12px 14px" }} placeholder="However it went, if you'd like to remember it" value={note} onChange={(e) => setNote(e.target.value)} />
             <button style={S.primary} onClick={done}>I did it</button>
             <button style={S.ghost} onClick={async () => await persist({ ...db, gesture: null, restedOn: TODAY() })}>Not today</button>
