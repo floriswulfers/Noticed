@@ -262,6 +262,7 @@ function friendlyError(e) {
 
 const THRESHOLD = [
   { big: "Noticed", small: "A quieter way to love the people who matter." },
+  { big: "I don't want the people who matter most to slowly drift out of my life.", small: "That's the whole reason this exists." },
   { big: "We think of them often.", small: "We just forget to let them know. Life gets loud." },
   { big: "Not a reminder app.", small: "No nagging, no lists. A place that helps you notice, then steps back." },
   { big: "Tell it about the people rooted in your heart.", small: "Whenever it suits you. The small, true things you'd otherwise lose are kept safe here." },
