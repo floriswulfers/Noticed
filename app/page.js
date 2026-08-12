@@ -269,6 +269,88 @@ const THRESHOLD = [
   { big: "Slowly, you'll find your way back to them.", small: "A better friend. A better son, daughter, sister, brother." },
 ];
 
+// Wraps the browser SpeechRecognition API into a small, self contained
+// controller with its own text buffer, so any number of independent mics
+// (Keep's dictation, the gesture reflection's) can exist at once without
+// sharing state. Continuous mode is unreliable on mobile (Android Chrome
+// especially): a single long-lived session restarts and redelivers results
+// on its own in ways that duplicate text no matter how the results are
+// reassembled. So each recognition instance here captures exactly one
+// utterance (continuous = false): it listens until a pause, returns one
+// final result, and ends. That single utterance is committed to `listenBase`
+// exactly once in onend, then — if the caller hasn't pressed stop — a fresh
+// instance starts for the next utterance with an empty result list, so
+// nothing already committed can be re-added.
+function useVoiceCapture() {
+  const [listening, setListening] = useState(false);
+  const [text, setText] = useState("");
+  const rec = useRef(null);
+  const wantListening = useRef(false);
+  const listenBase = useRef(""); // committed text: manual typing + everything finalized across restarts
+
+  const startRecognitionInstance = () => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const r = new SR();
+    r.continuous = false;
+    r.interimResults = true;
+    r.lang = navigator.language || "en-US";
+
+    let utteranceFinal = "";
+
+    r.onresult = (e) => {
+      let interim = "";
+      let finalText = "";
+      for (let i = 0; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t + " ";
+        else interim += t;
+      }
+      utteranceFinal = finalText.trim();
+      const combined = [listenBase.current, utteranceFinal].filter(Boolean).join(" ");
+      setText(interim ? `${combined} ${interim}` : combined);
+    };
+
+    r.onerror = (e) => {
+      if (["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported"].includes(e.error)) {
+        wantListening.current = false;
+      }
+    };
+
+    r.onend = () => {
+      listenBase.current = [listenBase.current, utteranceFinal].filter(Boolean).join(" ");
+      if (wantListening.current) {
+        startRecognitionInstance(); // pick up the next utterance
+      } else {
+        setListening(false);
+      }
+    };
+
+    r.start();
+    rec.current = r;
+  };
+
+  const listen = () => {
+    const SR = typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition);
+    if (!SR) return;
+    listenBase.current = text.trim(); // keep anything typed before pressing the mic
+    wantListening.current = true;
+    startRecognitionInstance();
+    setListening(true);
+  };
+  const stop = () => {
+    wantListening.current = false;
+    rec.current?.stop();
+    setListening(false);
+  };
+  const reset = () => {
+    stop();
+    listenBase.current = "";
+    setText("");
+  };
+
+  return { listening, text, setText, listen, stop, reset };
+}
+
 export default function Noticed() {
   const [db, setDb] = useState(BLANK_DB);
   const [loaded, setLoaded] = useState(false);
@@ -286,11 +368,10 @@ export default function Noticed() {
   const [nameInput, setNameInput] = useState("");
   const [firstPerson, setFirstPerson] = useState("");
   const [view, setView] = useState("keep");
-  const [listening, setListening] = useState(false);
-  const [transcript, setTranscript] = useState("");
+  const keepVoice = useVoiceCapture();
+  const reflectVoice = useVoiceCapture();
   const [kept, setKept] = useState(null);
   const [working, setWorking] = useState("");
-  const [note, setNote] = useState("");
   const [supported, setSupported] = useState(true);
   const [editing, setEditing] = useState(null);
   const [aliasInput, setAliasInput] = useState(""); // raw text of the nicknames field, parsed only on save
@@ -299,10 +380,7 @@ export default function Noticed() {
   const [mergePreview, setMergePreview] = useState(null);
   const [confirmRelease, setConfirmRelease] = useState(false);
   const [undo, setUndo] = useState(null);
-  const rec = useRef(null);
   const asked = useRef(false);
-  const wantListening = useRef(false);
-  const listenBase = useRef(""); // committed text: manual typing + everything finalized across restarts
   const undoTimer = useRef(null);
 
   // Keep the nicknames field's raw text in sync with whichever person is
@@ -427,74 +505,9 @@ export default function Noticed() {
     }
   };
 
-  /* ── voice ──────────────────────────────── */
-  // Continuous mode is unreliable on mobile (Android Chrome especially): a
-  // single long-lived session restarts and redelivers results on its own in
-  // ways that duplicate text no matter how the results are reassembled. So
-  // each recognition instance here captures exactly one utterance (continuous
-  // = false): it listens until a pause, returns one final result, and ends.
-  // That single utterance is committed to `listenBase` exactly once in onend,
-  // then — if the user hasn't pressed stop — a fresh instance starts for the
-  // next utterance with an empty result list, so nothing already committed
-  // can be re-added.
-  const startRecognitionInstance = () => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const r = new SR();
-    r.continuous = false;
-    r.interimResults = true;
-    r.lang = navigator.language || "en-US";
-
-    let utteranceFinal = "";
-
-    r.onresult = (e) => {
-      let interim = "";
-      let finalText = "";
-      for (let i = 0; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) finalText += t + " ";
-        else interim += t;
-      }
-      utteranceFinal = finalText.trim();
-      const combined = [listenBase.current, utteranceFinal].filter(Boolean).join(" ");
-      setTranscript(interim ? `${combined} ${interim}` : combined);
-    };
-
-    r.onerror = (e) => {
-      if (["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported"].includes(e.error)) {
-        wantListening.current = false;
-      }
-    };
-
-    r.onend = () => {
-      listenBase.current = [listenBase.current, utteranceFinal].filter(Boolean).join(" ");
-      if (wantListening.current) {
-        startRecognitionInstance(); // pick up the next utterance
-      } else {
-        setListening(false);
-      }
-    };
-
-    r.start();
-    rec.current = r;
-  };
-
-  const listen = () => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return;
-    listenBase.current = transcript.trim(); // keep anything typed before pressing Speak
-    wantListening.current = true;
-    startRecognitionInstance();
-    setListening(true);
-  };
-  const stop = () => {
-    wantListening.current = false;
-    rec.current?.stop();
-    setListening(false);
-  };
-
   /* ── capture ────────────────────────────── */
   const keep = async () => {
-    const text = transcript.trim();
+    const text = keepVoice.text.trim();
     if (!text) return;
     setWorking("Keeping it…");
     const known = db.people
@@ -556,7 +569,7 @@ ONLY JSON:
       }
 
       await persist({ ...db, people, memories: [...db.memories, ...memories], interactions: [...db.interactions, ...interactions], weeks: [...db.weeks, { id: weekId, at: date, text }] });
-      setTranscript(""); setWorking(""); setKept(names);
+      keepVoice.reset(); setWorking(""); setKept(names);
     } catch (e) {
       console.error(e); setWorking("Hm, that didn't land: " + (e?.message || "unknown") + ". Try again.");
     }
@@ -591,7 +604,7 @@ ONLY JSON:
     setPendingKeep(null);
     setWorking("Keeping it…");
     await persist({ ...db, people: nextPeople, memories: [...db.memories, ...nextMemories], interactions: [...db.interactions, ...nextInteractions], weeks: [...db.weeks, { id: weekId, at: date, text }] });
-    setWorking(""); setKept(nextNames); setTranscript("");
+    setWorking(""); setKept(nextNames); keepVoice.reset();
   };
 
   /* ── triggers ───────────────────────────── */
@@ -670,18 +683,19 @@ ONLY JSON:
 
   const done = async () => {
     const personId = db.gesture.personId;
-    const trimmed = note.trim();
+    const trimmed = reflectVoice.text.trim();
     const interaction = makeInteraction(personId, "contact", trimmed, db.gesture.date);
     const memories = trimmed
       ? [...db.memories, { id: genId("m"), personIds: [personId], date: TODAY(), text: trimmed, sourceWeekId: null }]
       : db.memories;
     await persist({ ...db, memories, interactions: [...db.interactions, interaction], gesture: null, restedOn: TODAY() });
-    setNote("");
+    reflectVoice.reset();
   };
 
   const restToday = async () => {
     const interaction = makeInteraction(db.gesture.personId, "rested", null, db.gesture.date);
     await persist({ ...db, interactions: [...db.interactions, interaction], gesture: null, restedOn: TODAY() });
+    reflectVoice.reset();
   };
 
   // Opening/closing the edit sheet always resets any in-progress merge or
@@ -778,8 +792,10 @@ ONLY JSON:
     aside: { fontSize: 14, lineHeight: 1.6, color: INK_SOFT, fontStyle: "italic", marginTop: 14 },
     contactRow: { display: "flex", gap: 8, marginTop: 22 },
     contactBtn: { flex: 1, textAlign: "center", textDecoration: "none", background: "transparent", color: INK, border: `1px solid ${LINE}`, borderRadius: 999, padding: "12px 0", fontSize: 13, fontFamily: "inherit", cursor: "pointer", boxSizing: "border-box" },
-    noteRow: { display: "flex", alignItems: "center", gap: 10, marginTop: 22 },
-    noteInp: { flex: 1, background: "transparent", border: "none", borderBottom: `1px solid ${LINE}`, padding: "4px 0", color: INK_SOFT, fontSize: 13, fontStyle: "italic", fontFamily: "inherit", outline: "none" },
+    noteRow: { display: "flex", alignItems: "flex-start", gap: 10, marginTop: 22 },
+    noteMic: (on) => ({ flexShrink: 0, marginTop: 3, background: "none", border: "none", padding: 0, color: on ? EMBER : FAINT, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit", animation: on ? "breathe 2.4s ease-in-out infinite" : "none" }),
+    noteTa: { flex: 1, background: "transparent", border: "none", borderBottom: `1px solid ${LINE}`, padding: "4px 0", color: INK_SOFT, fontSize: 13, fontStyle: "italic", fontFamily: "inherit", outline: "none", resize: "none", minHeight: 20, lineHeight: 1.5 },
+    noteSaveRow: { textAlign: "right", marginTop: 6 },
     noteSave: { background: "none", border: "none", padding: 0, color: EMBER, fontSize: 12.5, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" },
   };
 
@@ -1036,12 +1052,12 @@ ONLY JSON:
             <div style={{ ...S.serif, margin: "10px 0 24px", color: INK_SOFT }}>Who was on your heart?</div>
           )}
           {supported && (
-            <button style={S.mic(listening)} onClick={listening ? stop : listen}>{listening ? "Listening" : "Hold to tell me"}</button>
+            <button style={S.mic(keepVoice.listening)} onClick={keepVoice.listening ? keepVoice.stop : keepVoice.listen}>{keepVoice.listening ? "Listening" : "Hold to tell me"}</button>
           )}
-          <textarea style={S.ta} placeholder={supported ? "…or type it, if you'd rather" : "Type what happened"} value={transcript} onChange={(e) => setTranscript(e.target.value)} />
+          <textarea style={S.ta} placeholder={supported ? "…or type it, if you'd rather" : "Type what happened"} value={keepVoice.text} onChange={(e) => keepVoice.setText(e.target.value)} />
           <div style={{ ...S.body, fontSize: 12.5, color: FAINT, marginTop: 12 }}>Nothing is asked of you here. People appear by being mentioned.</div>
           {working && <div style={{ ...S.body, color: EMBER, marginTop: 14 }}>{working}</div>}
-          <button style={S.primary} onClick={keep} disabled={!transcript.trim()}>Keep this</button>
+          <button style={S.primary} onClick={keep} disabled={!keepVoice.text.trim()}>Keep this</button>
         </div>
       )}
 
@@ -1086,9 +1102,24 @@ ONLY JSON:
             )}
             <button style={S.ghost} onClick={restToday}>Not today</button>
             <div style={S.noteRow}>
-              <input style={S.noteInp} placeholder="If you do, tell me how it felt" value={note} onChange={(e) => setNote(e.target.value)} />
-              {note.trim() && <button style={S.noteSave} onClick={done}>Save</button>}
+              {supported && (
+                <button
+                  style={S.noteMic(reflectVoice.listening)}
+                  onClick={reflectVoice.listening ? reflectVoice.stop : reflectVoice.listen}
+                >
+                  {reflectVoice.listening ? "Listening…" : "Speak"}
+                </button>
+              )}
+              <textarea
+                style={S.noteTa}
+                placeholder="If you do, tell me how it felt"
+                value={reflectVoice.text}
+                onChange={(e) => reflectVoice.setText(e.target.value)}
+              />
             </div>
+            {reflectVoice.text.trim() && (
+              <div style={S.noteSaveRow}><button style={S.noteSave} onClick={done}>Save</button></div>
+            )}
           </div>
           <p style={{ ...S.body, padding: "4px 26px", fontSize: 12.5, color: FAINT }}>One person. Never a list. Never a guilt trip.</p>
         </>
