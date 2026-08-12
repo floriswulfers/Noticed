@@ -265,7 +265,7 @@ const THRESHOLD = [
   { big: "I don't want the people who matter most to slowly drift out of my life.", small: "That's the whole reason this exists." },
   { big: "We think of them often.", small: "We just forget to let them know. Life gets loud." },
   { big: "Not a reminder app.", small: "No nagging, no lists. A place that helps you notice, then steps back." },
-  { big: "Tell it about the people rooted in your heart.", small: "Whenever it suits you. The small, true things you'd otherwise lose are kept safe here." },
+  { big: "Tell me about the people rooted in your heart.", small: "Whenever it suits you. The small, true things you'd otherwise lose are kept safe here." },
   { big: "And now and then,", small: "a reason to reach for someone finds its way to you. The words are always yours." },
   { big: "Slowly, you'll find your way back to them.", small: "A better friend. A better son, daughter, sister, brother." },
 ];
@@ -372,6 +372,7 @@ export default function Noticed() {
   const keepVoice = useVoiceCapture();
   const reflectVoice = useVoiceCapture();
   const [kept, setKept] = useState(null);
+  const [reflected, setReflected] = useState(null);
   const [working, setWorking] = useState("");
   const [supported, setSupported] = useState(true);
   const [editing, setEditing] = useState(null);
@@ -705,6 +706,7 @@ Rules:
 ONLY JSON:
 {"why":"","act":"","worthNaming":null}`);
       await persist({ ...db, gesture: { date: TODAY(), personId: p.id, name: callname, reason: t.reason, kind: t.kind, ...g } });
+      setReflected(null);
     } catch (e) { setWorking("The engine stumbled."); }
   };
 
@@ -719,6 +721,7 @@ ONLY JSON:
 
   const done = async () => {
     const personId = db.gesture.personId;
+    const name = db.gesture.name;
     const trimmed = reflectVoice.text.trim();
     const interaction = makeInteraction(personId, "contact", trimmed, db.gesture.date);
     const memories = trimmed
@@ -726,12 +729,14 @@ ONLY JSON:
       : db.memories;
     await persist({ ...db, memories, interactions: [...db.interactions, interaction], gesture: null, restedOn: TODAY() });
     reflectVoice.reset();
+    if (trimmed) setReflected(name);
   };
 
   const restToday = async () => {
     const interaction = makeInteraction(db.gesture.personId, "rested", null, db.gesture.date);
     await persist({ ...db, interactions: [...db.interactions, interaction], gesture: null, restedOn: TODAY() });
     reflectVoice.reset();
+    setReflected(null);
   };
 
   // Opening/closing the edit sheet always resets any in-progress merge or
@@ -833,6 +838,7 @@ ONLY JSON:
     lightTouchCaption: { fontSize: 12.5, color: FAINT, marginTop: 2, marginBottom: 8 },
     lightTouchRow: { display: "flex", gap: 16 },
     lightTouchLink: { textDecoration: "none", color: INK_SOFT, fontSize: 12.5, borderBottom: `1px solid ${LINE}`, paddingBottom: 2 },
+    backLink: { background: "none", border: "none", padding: 0, marginTop: 22, color: FAINT, fontSize: 12.5, cursor: "pointer", fontFamily: "inherit", alignSelf: "flex-start" },
     noteRow: { display: "flex", alignItems: "flex-start", gap: 10, marginTop: 22 },
     noteMic: (on) => ({ flexShrink: 0, marginTop: 3, background: "none", border: "none", padding: 0, color: on ? EMBER : FAINT, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit", animation: on ? "breathe 2.4s ease-in-out infinite" : "none" }),
     noteTa: { flex: 1, background: "transparent", border: "none", borderBottom: `1px solid ${LINE}`, padding: "4px 0", color: INK_SOFT, fontSize: 13, fontStyle: "italic", fontFamily: "inherit", outline: "none", resize: "none", minHeight: 20, lineHeight: 1.5 },
@@ -911,6 +917,9 @@ ONLY JSON:
             </div>
           )}
         </div>
+        {slide > 0 && (
+          <button style={S.backLink} onClick={() => setSlide(slide - 1)}>Back</button>
+        )}
         <div style={{ display: "flex", gap: 6, marginTop: 32 }}>
           {THRESHOLD.map((_, i) => (
             <div key={i} style={{ height: 2, flex: 1, background: i <= slide ? EMBER : LINE, borderRadius: 2, transition: "background .4s" }} />
@@ -1108,14 +1117,14 @@ ONLY JSON:
           <div style={S.eyebrow}>Kept</div>
           <div style={{ ...S.serif, marginBottom: 18 }}>{kept.length ? `${kept.join(", ")}, remembered.` : "Remembered."}</div>
           <div style={S.body}>Nothing to do now. Something will come to you when it's the right moment.</div>
-          <button style={S.ghost} onClick={() => setKept(null)}>Tell it something else</button>
+          <button style={S.ghost} onClick={() => setKept(null)}>Tell me something else</button>
         </div>
       )}
 
       {view === "today" && !db.people.length && (
         <div style={S.card}>
           <div style={S.name}>Nobody yet</div>
-          <div style={S.body}>Tell it about your week and the people will appear on their own.</div>
+          <div style={S.body}>Tell me about your week and the people will appear on their own.</div>
           <button style={S.primary} onClick={() => setView("keep")}>Talk about your week</button>
         </div>
       )}
@@ -1129,11 +1138,19 @@ ONLY JSON:
         </div>
       )}
 
-      {view === "today" && db.people.length > 0 && !db.paused && !g && (
+      {view === "today" && db.people.length > 0 && !db.paused && !g && reflected && (
+        <div style={{ ...S.card, animation: "fade .6s ease" }}>
+          <div style={S.eyebrow}>Kept</div>
+          <div style={{ ...S.serif, marginBottom: 16 }}>Thank you for telling me how it went with {reflected}.</div>
+          <div style={S.body}>That's part of their story now.</div>
+        </div>
+      )}
+
+      {view === "today" && db.people.length > 0 && !db.paused && !g && !reflected && (
         <div style={S.card}>
           <div style={S.eyebrow}>{working ? "…" : "Today"}</div>
           <div style={{ ...S.serif, marginBottom: 16 }}>{working ? "Thinking about someone…" : "Nothing today."}</div>
-          {!working && <div style={S.body}>That's allowed. It'll come when there's a reason.</div>}
+          {!working && <div style={S.body}>That's allowed. I'll let you know when there's a reason.</div>}
         </div>
       )}
 
@@ -1228,12 +1245,12 @@ ONLY JSON:
               </>
             ) : !confirmPause ? (
               <>
-                <div style={S.body}>Need a break? Resting keeps everything you've kept exactly as it is, it just stops gently reaching for you until you're ready again.</div>
+                <div style={S.body}>Need a break? Resting keeps everything you've kept exactly as it is, I just stop gently reaching for you until you're ready again.</div>
                 <button style={S.ghost} onClick={() => setConfirmPause(true)}>Rest this for now</button>
               </>
             ) : (
               <>
-                <div style={{ ...S.body, fontSize: 12.5, marginBottom: 12 }}>Nothing will be deleted. People, memories, everything stays exactly as you left it. Noticed just stops looking for a reason to reach you until you come back.</div>
+                <div style={{ ...S.body, fontSize: 12.5, marginBottom: 12 }}>Nothing will be deleted. People, memories, everything stays exactly as you left it. I just stop looking for a reason to reach you until you come back.</div>
                 <button style={S.primary} onClick={pauseAccount}>Yes, rest this for now</button>
                 <button style={S.ghost} onClick={() => setConfirmPause(false)}>Cancel</button>
               </>
