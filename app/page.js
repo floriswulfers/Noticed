@@ -1,6 +1,6 @@
 "use client";
 import React, { useState, useEffect, useRef } from "react";
-import { loadState, saveState, getSession, onAuthChange, signIn, signUp, signOut } from "../lib/supabase";
+import { loadState, saveState, getSession, onAuthChange, signIn, signUp, signOut, deleteAccount } from "../lib/supabase";
 
 /* ─────────────────────────────────────────────
    NOTICED — v1.0 (real, database-backed)
@@ -48,7 +48,7 @@ function joinFragments(raw) {
   return joined.charAt(0).toUpperCase() + joined.slice(1) + ".";
 }
 const TODAY = () => new Date().toISOString().slice(0, 10);
-const BLANK_DB = { people: [], memories: [], interactions: [], weeks: [], gesture: null, restedOn: null, user: null, onboarded: false };
+const BLANK_DB = { people: [], memories: [], interactions: [], weeks: [], gesture: null, restedOn: null, user: null, onboarded: false, paused: false };
 
 const genId = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
@@ -380,6 +380,10 @@ export default function Noticed() {
   const [mergePicker, setMergePicker] = useState(false);
   const [mergePreview, setMergePreview] = useState(null);
   const [confirmRelease, setConfirmRelease] = useState(false);
+  const [confirmPause, setConfirmPause] = useState(false);
+  const [confirmDeleteAccount, setConfirmDeleteAccount] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
   const [undo, setUndo] = useState(null);
   const asked = useRef(false);
   const undoTimer = useRef(null);
@@ -391,6 +395,15 @@ export default function Noticed() {
   useEffect(() => {
     setAliasInput(editing ? (editing.aliases || []).join(", ") : "");
   }, [editing?.id]);
+
+  // Leaving Settings should never leave a confirm step armed for next time.
+  useEffect(() => {
+    if (view !== "settings") {
+      setConfirmPause(false);
+      setConfirmDeleteAccount(false);
+      setDeleteError("");
+    }
+  }, [view]);
 
   /* ── who's signed in ────────────────────────── */
   useEffect(() => {
@@ -485,6 +498,28 @@ export default function Noticed() {
 
   const handleSignOut = async () => {
     await signOut();
+  };
+
+  /* ── rest the account for now ──────────────── */
+  const pauseAccount = async () => {
+    await persist({ ...db, paused: true });
+    setConfirmPause(false);
+  };
+  const resumeAccount = async () => {
+    await persist({ ...db, paused: false });
+  };
+
+  /* ── release the account, permanently ──────── */
+  const releaseAccount = async () => {
+    setDeleteBusy(true);
+    setDeleteError("");
+    try {
+      await deleteAccount();
+      await signOut();
+    } catch (e) {
+      setDeleteError(friendlyError(e));
+      setDeleteBusy(false);
+    }
   };
 
   /* ── the engine, via secret server route ──── */
@@ -675,12 +710,12 @@ ONLY JSON:
 
   useEffect(() => {
     if (!loaded || asked.current) return;
-    if (view !== "today" || !db.onboarded) return;
+    if (view !== "today" || !db.onboarded || db.paused) return;
     if (db.gesture?.date === TODAY() || db.restedOn === TODAY() || !db.people.length) return;
     asked.current = true;
     setWorking("…");
     summon();
-  }, [view, loaded, db.people.length, db.onboarded]);
+  }, [view, loaded, db.people.length, db.onboarded, db.paused]);
 
   const done = async () => {
     const personId = db.gesture.personId;
@@ -793,6 +828,11 @@ ONLY JSON:
     aside: { fontSize: 14, lineHeight: 1.6, color: INK_SOFT, fontStyle: "italic", marginTop: 14 },
     contactRow: { display: "flex", gap: 8, marginTop: 22 },
     contactBtn: { flex: 1, textAlign: "center", textDecoration: "none", background: "transparent", color: INK, border: `1px solid ${LINE}`, borderRadius: 999, padding: "12px 0", fontSize: 13, fontFamily: "inherit", cursor: "pointer", boxSizing: "border-box" },
+    lightTouch: { marginTop: 14 },
+    lightTouchLabel: { fontFamily: "'Instrument Serif',Georgia,serif", fontStyle: "italic", fontSize: 15, color: FAINT },
+    lightTouchCaption: { fontSize: 12.5, color: FAINT, marginTop: 2, marginBottom: 8 },
+    lightTouchRow: { display: "flex", gap: 16 },
+    lightTouchLink: { textDecoration: "none", color: INK_SOFT, fontSize: 12.5, borderBottom: `1px solid ${LINE}`, paddingBottom: 2 },
     noteRow: { display: "flex", alignItems: "flex-start", gap: 10, marginTop: 22 },
     noteMic: (on) => ({ flexShrink: 0, marginTop: 3, background: "none", border: "none", padding: 0, color: on ? EMBER : FAINT, fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", cursor: "pointer", fontFamily: "inherit", animation: on ? "breathe 2.4s ease-in-out infinite" : "none" }),
     noteTa: { flex: 1, background: "transparent", border: "none", borderBottom: `1px solid ${LINE}`, padding: "4px 0", color: INK_SOFT, fontSize: 13, fontStyle: "italic", fontFamily: "inherit", outline: "none", resize: "none", minHeight: 20, lineHeight: 1.5 },
@@ -900,6 +940,7 @@ ONLY JSON:
 
   const g = db.gesture?.date === TODAY() ? db.gesture : null;
   const contacts = g ? contactOptions(db.people.find((p) => p.id === g.personId)?.phone) : [];
+  const lightContacts = contacts.filter((c) => c.key !== "call");
   const worthNaming = g ? joinFragments(g.worthNaming) : null;
   const hour = new Date().getHours();
   const timeword = hour < 12 ? "Morning" : hour < 18 ? "Afternoon" : "Evening";
@@ -1025,7 +1066,7 @@ ONLY JSON:
           <button style={S.nb(view === "keep")} onClick={() => setView("keep")}>Keep</button>
           <button style={S.nb(view === "today")} onClick={() => setView("today")}>Today</button>
           <button style={S.nb(view === "people")} onClick={() => setView("people")}>People</button>
-          <button style={S.nb(false)} onClick={handleSignOut}>Sign out</button>
+          <button style={S.nb(view === "settings")} onClick={() => setView("settings")}>Settings</button>
         </nav>
       </header>
 
@@ -1079,7 +1120,16 @@ ONLY JSON:
         </div>
       )}
 
-      {view === "today" && db.people.length > 0 && !g && (
+      {view === "today" && db.people.length > 0 && db.paused && (
+        <div style={S.card}>
+          <div style={S.eyebrow}>Resting</div>
+          <div style={{ ...S.serif, marginBottom: 16 }}>Take your time.</div>
+          <div style={S.body}>Everything you've kept is safe, waiting for whenever you come back.</div>
+          <button style={S.ghost} onClick={() => setView("settings")}>Adjust in Settings</button>
+        </div>
+      )}
+
+      {view === "today" && db.people.length > 0 && !db.paused && !g && (
         <div style={S.card}>
           <div style={S.eyebrow}>{working ? "…" : "Today"}</div>
           <div style={{ ...S.serif, marginBottom: 16 }}>{working ? "Thinking about someone…" : "Nothing today."}</div>
@@ -1087,7 +1137,7 @@ ONLY JSON:
         </div>
       )}
 
-      {view === "today" && g && (
+      {view === "today" && !db.paused && g && (
         <>
           <div style={{ ...S.card, animation: "fade .6s ease" }}>
             <div style={S.kept}>I kept this for you.</div>
@@ -1099,6 +1149,17 @@ ONLY JSON:
                 {contacts.map((c) => (
                   <a key={c.key} href={c.href} style={S.contactBtn}>{c.label}</a>
                 ))}
+              </div>
+            )}
+            {lightContacts.length > 0 && (
+              <div style={S.lightTouch}>
+                <div style={S.lightTouchLabel}>Send a little love</div>
+                <div style={S.lightTouchCaption}>If a real conversation feels like a lot right now, a heart is enough.</div>
+                <div style={S.lightTouchRow}>
+                  {lightContacts.map((c) => (
+                    <a key={c.key} href={c.href} style={S.lightTouchLink}>{c.label}</a>
+                  ))}
+                </div>
               </div>
             )}
             <button style={S.ghost} onClick={restToday}>Not today</button>
@@ -1148,6 +1209,52 @@ ONLY JSON:
             );
           })}
           {db.people.length > 0 && <div style={{ ...S.body, fontSize: 12, color: FAINT, marginTop: 14 }}>Tap anyone to add a nickname or their birthday.</div>}
+        </div>
+      )}
+
+      {view === "settings" && (
+        <div style={S.card}>
+          <div style={S.eyebrow}>Settings</div>
+          {session?.user?.email && <div style={{ ...S.body, fontSize: 12.5, color: FAINT, marginBottom: 20 }}>Signed in as {session.user.email}.</div>}
+
+          <button style={S.ghost} onClick={handleSignOut}>Sign out</button>
+
+          <div style={{ marginTop: 26, borderTop: `1px solid ${LINE}`, paddingTop: 20 }}>
+            {db.paused ? (
+              <>
+                <div style={{ ...S.serif, marginBottom: 10 }}>Resting.</div>
+                <div style={S.body}>Take your time. Everything you've kept is safe, waiting for whenever you come back.</div>
+                <button style={S.ghost} onClick={resumeAccount}>I'm ready, resume</button>
+              </>
+            ) : !confirmPause ? (
+              <>
+                <div style={S.body}>Need a break? Resting keeps everything you've kept exactly as it is, it just stops gently reaching for you until you're ready again.</div>
+                <button style={S.ghost} onClick={() => setConfirmPause(true)}>Rest this for now</button>
+              </>
+            ) : (
+              <>
+                <div style={{ ...S.body, fontSize: 12.5, marginBottom: 12 }}>Nothing will be deleted. People, memories, everything stays exactly as you left it. Noticed just stops looking for a reason to reach you until you come back.</div>
+                <button style={S.primary} onClick={pauseAccount}>Yes, rest this for now</button>
+                <button style={S.ghost} onClick={() => setConfirmPause(false)}>Cancel</button>
+              </>
+            )}
+          </div>
+
+          <div style={{ marginTop: 26, borderTop: `1px solid ${LINE}`, paddingTop: 20 }}>
+            {!confirmDeleteAccount ? (
+              <>
+                <div style={S.body}>Release my account permanently deletes your account and everything kept in it. This can't be brought back.</div>
+                <button style={{ ...S.ghost, color: EMBER }} onClick={() => setConfirmDeleteAccount(true)}>Release my account</button>
+              </>
+            ) : (
+              <>
+                <div style={{ ...S.body, color: EMBER, fontSize: 12.5, marginBottom: 12 }}>This deletes your account and everyone kept in it, for good. There's no undo once this is done.</div>
+                {deleteError && <div style={{ ...S.body, color: EMBER, fontSize: 12.5, marginBottom: 12 }}>{deleteError}</div>}
+                <button style={{ ...S.primary, background: EMBER }} onClick={releaseAccount} disabled={deleteBusy}>{deleteBusy ? "Deleting…" : "Yes, delete everything"}</button>
+                <button style={S.ghost} onClick={() => setConfirmDeleteAccount(false)}>Cancel</button>
+              </>
+            )}
+          </div>
         </div>
       )}
     </div>
