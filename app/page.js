@@ -562,6 +562,7 @@ Keep every field short, written in my own plain words, first person (I, me, my).
 "threads" = specific true things worth remembering, human and verbatim ish, not blandly summarised.
 "hardDates" = anniversaries of painful things others forget. YYYY-MM-DD, only if implied.
 "upcoming" = a specific thing about to happen to them, with rough date.
+In "who", "carries", "loves", and "threads", never write a literal date like ${TODAY()}. If timing matters, describe it the way a friend would, naturally and approximately (recently, a couple of days ago, last week, this morning), never a raw date or an exact day count. Save literal dates for "hardDates" and "upcoming" only.
 Never use hyphens or dashes anywhere. Use commas or separate sentences.
 
 ONLY JSON:
@@ -1217,7 +1218,6 @@ ONLY JSON:
                     {p.label || p.name}
                   </div>
                   <div style={{ fontSize: 12.5, color: FAINT, lineHeight: 1.45 }}>{p.who}</div>
-                  {p.birthday && <div style={{ fontSize: 12, color: DEEP, marginTop: 4 }}>🎂 {new Date(p.birthday).toLocaleDateString(undefined, { month: "long", day: "numeric" })}</div>}
                   {p.hardDates?.length > 0 && <div style={{ fontSize: 12, color: DEEP, marginTop: 4 }}>{p.hardDates[0].what}</div>}
                   {personMemories.length > 0 && <div style={{ fontSize: 12.5, color: INK_SOFT, marginTop: 6, fontStyle: "italic" }}>"{personMemories[personMemories.length - 1].text}"</div>}
                 </div>
